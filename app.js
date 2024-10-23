@@ -5,111 +5,261 @@ const mongoose = require('mongoose');
 const app = express();
 const port = process.env.PORT || 3000;
 
-const bot = new Telegraf('Your BOT Id'); // Replace with your bot token
+const bot = new Telegraf(process.env.BOT_TOKEN); // Replace with your bot token
 
-
+// Check for the clean-db flag
+const shouldCleanDb = process.argv.includes('--clean-db');
 
 mongoose
     .connect(process.env.MONGODB_URI, {
         useNewUrlParser: true,
         useUnifiedTopology: true,
     })
-    .then(() => {
+    .then(async () => {
         const db = mongoose.connection;
         const userQuizCollection = db.collection('userQuiz');
-        app.get('/', (req, res) => {
-            res.send('Hello, Heroku!' + db);
+
+        // If the flag --clean-db is provided, clean the database
+        if (shouldCleanDb) {
+            console.log('Cleaning the database...');
+            await userQuizCollection.deleteMany({}); // Deletes all documents in the collection
+            console.log('Database cleaned.');
+        }
+
+        // Creative and Interesting Quizzes
+        const quizzes = {
+            1: {
+                quizId: 1,
+                title: "World Wonders Quiz",
+                questions: [
+                    {
+                        question: "Which of these is one of the Seven Wonders of the Ancient World?",
+                        options: ['Great Wall of China', 'Pyramids of Giza', 'Eiffel Tower', 'Statue of Liberty'],
+                        correct: 'Pyramids of Giza',
+                    },
+                    {
+                        question: "Which wonder is located in Brazil?",
+                        options: ['Colosseum', 'Taj Mahal', 'Christ the Redeemer', 'Machu Picchu'],
+                        correct: 'Christ the Redeemer',
+                    }
+                ],
+            },
+            2: {
+                quizId: 2,
+                title: "Famous Inventions Quiz",
+                questions: [
+                    {
+                        question: "Who invented the telephone?",
+                        options: ['Thomas Edison', 'Nikola Tesla', 'Alexander Graham Bell', 'Isaac Newton'],
+                        correct: 'Alexander Graham Bell',
+                    },
+                    {
+                        question: "Which invention is Thomas Edison famous for?",
+                        options: ['Light Bulb', 'Radio', 'Airplane', 'Steam Engine'],
+                        correct: 'Light Bulb',
+                    }
+                ],
+            },
+            3: {
+                quizId: 3,
+                title: "Space Exploration Quiz",
+                questions: [
+                    {
+                        question: "What was the name of the first manned mission to land on the moon?",
+                        options: ['Apollo 11', 'Apollo 13', 'Voyager 1', 'Gemini 7'],
+                        correct: 'Apollo 11',
+                    },
+                    {
+                        question: "Which planet is known as the 'Morning Star' or 'Evening Star'?",
+                        options: ['Mars', 'Venus', 'Jupiter', 'Saturn'],
+                        correct: 'Venus',
+                    }
+                ],
+            },
+            4: {
+                quizId: 4,
+                title: "Pop Culture Quiz",
+                questions: [
+                    {
+                        question: "Which movie won the Academy Award for Best Picture in 1994?",
+                        options: ['Pulp Fiction', 'Forrest Gump', 'The Shawshank Redemption', 'The Lion King'],
+                        correct: 'Forrest Gump',
+                    },
+                    {
+                        question: "Which artist painted the Mona Lisa?",
+                        options: ['Vincent van Gogh', 'Leonardo da Vinci', 'Pablo Picasso', 'Claude Monet'],
+                        correct: 'Leonardo da Vinci',
+                    }
+                ],
+            },
+            5: {
+                quizId: 5,
+                title: "History Trivia Quiz",
+                questions: [
+                    {
+                        question: "Which empire was ruled by Julius Caesar?",
+                        options: ['Roman Empire', 'Ottoman Empire', 'Persian Empire', 'Byzantine Empire'],
+                        correct: 'Roman Empire',
+                    },
+                    {
+                        question: "Which event started World War I?",
+                        options: [
+                            'Assassination of Archduke Franz Ferdinand',
+                            'Germany invades Poland',
+                            'Pearl Harbor attack',
+                            'The sinking of the Lusitania'
+                        ],
+                        correct: 'Assassination of Archduke Franz Ferdinand',
+                    }
+                ],
+            }
+        };
+
+        mongoose.connection.on('connected', () => {
+            console.log('Connected to MongoDB');
         });
 
-        bot.command('start', async (ctx) => {
-            const userNameWithIds = [
-                { userId: 2075736184, username: 'Test', gems: 0 },
-            ];
-            const uniqueUserIds = await userQuizCollection.aggregate([
-                { $group: { _id: '$userId', quizIds: { $addToSet: '$quizId' } } }
+        mongoose.connection.on('error', (err) => {
+            console.error('MongoDB connection error:', err);
+        });
+
+        bot.command('listquizzes', async (ctx) => {
+            const userId = ctx.from.id;
+        
+            // Fetch the quizzes the user has completed
+            const completedQuizzes = await userQuizCollection.find({ userId, completed: true }).toArray();
+            const completedQuizIds = completedQuizzes.map(q => q.quizId);  // Extract the quizId's of completed quizzes
+        
+            let quizList = '📚 *Available Quizzes* 📚\n\n';
+            
+            for (const quizId in quizzes) {
+                const isCompleted = completedQuizIds.includes(parseInt(quizId));  // Check if the user has completed the quiz
+        
+                if (isCompleted) {
+                    quizList += `✅ /quiz_${quizId} - ${quizzes[quizId].title} (Completed)\n`;
+                } else {
+                    quizList += `🔸 /quiz_${quizId} - ${quizzes[quizId].title} (Available)\n`;
+                }
+            }
+        
+            // Escape characters for MarkdownV2
+            quizList = quizList.replace(/[_*[\]()~`>#+-=|{}.!]/g, '\\$&');
+        
+            await bot.telegram.sendMessage(ctx.chat.id, quizList, { parse_mode: 'MarkdownV2' });
+        });
+
+        bot.command('leaderboard', async (ctx) => {
+            const groupChatId = ctx.chat.id;
+        
+            // Fetch users and aggregate scores across quizzes
+            const leaderboard = await userQuizCollection.aggregate([
+                {
+                    $group: {
+                        _id: "$userId",  // Group by userId
+                        totalScore: { $sum: "$score" },  // Sum scores across all quizzes
+                        username: { $first: "$username" }  // Take the first username found
+                    }
+                },
+                { $sort: { totalScore: -1 } },  // Sort by total score (highest first)
+                { $limit: 10 }  // Limit to top 10
             ]).toArray();
-            const userIdsArray = uniqueUserIds.map((item) => item._id);
-            if (uniqueUserIds.length === 0) {
-                await ctx.reply('No users found in the database.');
+        
+            if (leaderboard.length === 0) {
+                await ctx.reply('No scores available yet.');
                 return;
             }
+        
+            // Format the leaderboard text
+            let leaderboardText = '🏆 *Leaderboard* 🏆\n\n';
+            leaderboard.forEach((user, index) => {
+                leaderboardText += `${index + 1}. ${user.username || 'Unknown'} - ${user.totalScore} points\n`;
+            });
+        
+            // Send the leaderboard to the group
+            await bot.telegram.sendMessage(groupChatId, leaderboardText, { parse_mode: 'Markdown' });
+        });
 
-            const leaderboard = await Promise.all(
-                userIdsArray.map(async (userId) => {
-                    const userScores = await userQuizCollection.aggregate([
-                        { $match: { userId } },
-                        {
-                            $group: {
-                                _id: '$userId',
-                                userText: { $first: '$userText' },
-                                quizIds: { $addToSet: '$quizId' },
-                                scores: { $push: '$score' },
-                            },
-                        },
-                    ]).toArray();
+        Object.keys(quizzes).forEach(quizId => {
+            const quizCommand = `quiz_${quizId}`;
 
-                    const user = userNameWithIds.find((item) => item.userId === userId);
-                    const username = user?.username || 'Unknown';
-                    const scores = userScores[0]?.scores || [];
-                    const gems = scores.filter((score) => score > 17).length;
-                    const totalScore = scores.reduce((a, b) => a + b, 0);
-                    const averageScore = scores.length > 0 ? totalScore / scores.length : 0;
-                    const averageScoreText = averageScore % 1 === 0 ? `Score: ${averageScore}` : `Score: ${averageScore.toFixed(2)}`;
-                    return { userId, username, score: totalScore, gems, averageScoreText };
-                })
-            );
+            bot.command(quizCommand, async (ctx) => {
+                console.log(`Quiz ${quizId} started by user ${ctx.from.username}`);
 
-
-
-
-            leaderboard.sort((a, b) => {
-                // Sort by the number of gems first
-                if (b.gems !== a.gems) {
-                    return b.gems - a.gems; // Sort in descending order of gems
+                const userId = ctx.from.id;
+                const user = await userQuizCollection.findOne({ userId, quizId: parseInt(quizId) });
+                if (user && user.completed) {
+                    await ctx.reply(`You have already completed the "${quizzes[quizId].title}" quiz.`);
+                    return;
                 }
 
-                // If the number of gems is the same, sort by the score
-                if (b.score !== a.score) {
-                    return b.score - a.score; // Sort in descending order of score
+                const currentQuestionIndex = 0;
+                await ctx.reply(`Starting quiz: ${quizzes[quizId].title}`);
+                await sendQuizQuestion(ctx.chat.id, quizId, currentQuestionIndex, userId);
+            });
+
+            async function sendQuizQuestion(chatId, quizId, questionIndex, userId) {
+                const quiz = quizzes[quizId];
+
+                if (!quiz) {
+                    console.error(`Quiz with ID ${quizId} not found.`);
+                    await bot.telegram.sendMessage(chatId, 'Error: Quiz not found.');
+                    return;
                 }
 
-                // If the score is also the same, sort by username
-                return a.username.localeCompare(b.username); // Sort in ascending order of username
+                const questionData = quiz.questions[questionIndex];
+                if (!questionData) {
+                    console.error(`Question at index ${questionIndex} not found for quiz ${quizId}.`);
+                    await bot.telegram.sendMessage(chatId, 'Error: Question not found.');
+                    return;
+                }
+
+                const buttons = questionData.options.map((option) =>
+                    Markup.button.callback(option, `answer:${quizId}:${questionIndex}:${option}:${userId}`)
+                );
+                const keyboard = Markup.inlineKeyboard(buttons, { columns: 1 });
+
+                await bot.telegram.sendMessage(chatId, `*${questionData.question}*`, keyboard);
+            }
+
+            bot.action(new RegExp(`answer:${quizId}:(\\d+):(.+):(\\d+)`), async (ctx) => {
+                const [_, questionIndex, userAnswer, userId] = ctx.match;
+                const quiz = quizzes[quizId];
+                const questionData = quiz.questions[questionIndex];
+
+                console.log(`User ${ctx.from.username} answered quiz ${quizId}, question ${questionIndex}`);
+
+                if (userAnswer === questionData.correct) {
+                    await ctx.reply('Correct answer! 🎉');
+
+                    await userQuizCollection.updateOne(
+                        { userId: parseInt(userId), quizId: parseInt(quizId) },
+                        { $inc: { score: 1 }, $set: { username: ctx.from.username } },
+                        { upsert: true }
+                    );
+                } else {
+                    await ctx.reply('Oops! Wrong answer. 😔');
+                }
+
+                const nextQuestionIndex = parseInt(questionIndex) + 1;
+                if (nextQuestionIndex < quiz.questions.length) {
+                    await sendQuizQuestion(ctx.chat.id, quizId, nextQuestionIndex, userId);
+                } else {
+                    await ctx.reply(`You have completed the quiz: ${quiz.title}.`);
+                    await userQuizCollection.updateOne(
+                        { userId: parseInt(userId), quizId: parseInt(quizId) },
+                        { $set: { completed: true } },
+                        { upsert: true }
+                    );
+                }
             });
-
-            const winnerButton = Markup.button.callback(`🥇${leaderboard[0].username} - ${leaderboard[0].averageScoreText} - (${leaderboard[0].gems}) ${leaderboard[0].gems > 0 ? '💎' : ''}`, 'disabled')
-            const secondButton = Markup.button.callback(`🥈${leaderboard[1].username} - ${leaderboard[1].averageScoreText} - (${leaderboard[1].gems}) ${leaderboard[1].gems > 0 ? '💎' : ''}`, 'disabled')
-            const thirdButton = Markup.button.callback(`🥉${leaderboard[2].username} - ${leaderboard[2].averageScoreText} - (${leaderboard[2].gems}) ${leaderboard[2].gems > 0 ? '💎' : ''}`, 'disabled')
-
-            const buttons = leaderboard.slice(3).map((user) => {
-                const gemsEmoji = user.gems > 0 ? '💎' : '';
-                const buttonLabel = `${user.username} - ${user.averageScoreText} - (${user.gems}) ${gemsEmoji}`;
-                return Markup.button.callback(buttonLabel, 'disabled');
-            });
-
-
-            const keyboard = Markup.inlineKeyboard([winnerButton, secondButton, thirdButton, ...buttons], { columns: 1 });
-
-            const title = 'Leaderboard';
-            const fullWidthSpace = '\u2005\u2005'; // Unicode characters for empty space (adjust the number of characters for desired width)
-            const centerTitle = `*${fullWidthSpace}${title}${fullWidthSpace}*`;
-
-            const replyMarkup = Markup.keyboard([]);
-            replyMarkup.resize().oneTime();
-
-            await ctx.replyWithMarkdownV2(centerTitle, replyMarkup);
-            await ctx.reply('Earn 50 💎 to become the Winner 🏆', keyboard);
         });
-        bot.action('disabled', (ctx) => {
-            ctx.answerCbQuery('This button is disabled.');
-        });
+
+        bot.launch();
+
         app.listen(port, () => {
             console.log(`Server running on port ${port}`);
         });
-    }).catch((err) => {
+    })
+    .catch((err) => {
         console.error('Error connecting to MongoDB', err);
     });
-
-
-
-bot.launch();
