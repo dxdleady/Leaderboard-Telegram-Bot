@@ -1,11 +1,16 @@
-require('dotenv').config();
+require('dotenv').config({
+    path: process.env.NODE_ENV === 'production' ? '.env' : '.env.local'
+});
 const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
 const mongoose = require('mongoose');
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.PORT;
+
 
 const bot = new Telegraf(process.env.BOT_TOKEN); // Replace with your bot token
+
+app.use(bot.webhookCallback('/api/webhook'));
 
 // Check for the clean-db flag
 const shouldCleanDb = process.argv.includes('--clean-db');
