@@ -14,7 +14,7 @@ app.use(bot.webhookCallback('/api/webhook'));
 
 // Check for the clean-db flag
 const shouldCleanDb = process.argv.includes('--clean-db');
-
+console.log(process.env.MONGODB_URI)
 mongoose
     .connect(process.env.MONGODB_URI, {
         useNewUrlParser: true,
