@@ -95,7 +95,7 @@ const getUserSession = (userId) => {
 };
 
 
-// Modified sendQuizQuestion function to handle multiple users
+// Modified sendQuizQuestion function with better message handling
 async function sendQuizQuestion(chatId, quizId, questionIndex, userId) {
   const quiz = quizzes[quizId];
   const questionData = quiz.questions[questionIndex];
@@ -104,51 +104,82 @@ async function sendQuizQuestion(chatId, quizId, questionIndex, userId) {
   if (!quiz || !questionData) {
     await bot.telegram.sendMessage(chatId, 'Error: Quiz or question not found.', {
       protect_content: true
-    });
+    }).catch(console.error);
     return;
   }
-
-  const messageText = [
-    `📝 *Question:*\n${escapeMarkdown(questionData.question)}`,
-    "",
-    `🔗 [Read full article](${escapeMarkdown(questionData.link)})`
-  ].join('\n');
-
-  // Create inline buttons with proper callback data
-  const buttons = questionData.options.map((option, index) => {
-    const callbackData = `q${quizId}_${questionIndex}_${index}_${userId}`;  // Add userId to callback
-    return Markup.button.callback(option, callbackData);
-  });
 
   try {
     // Delete previous message if it exists
     if (userSession.lastMessageId) {
-      try {
-        await bot.telegram.deleteMessage(chatId, userSession.lastMessageId);
-      } catch (error) {
-        console.log('Could not delete previous message:', error.message);
-      }
+      await bot.telegram.deleteMessage(chatId, userSession.lastMessageId)
+        .catch(error => console.log('Could not delete previous message:', error.message));
     }
 
-    const message = await bot.telegram.sendMessage(chatId, messageText, {
-      parse_mode: 'MarkdownV2',
-      ...Markup.inlineKeyboard(buttons.map(button => [button])),
-      protect_content: true
-    });
+    // Send messages with retry logic
+    const sendMessageWithRetry = async (text, options, retries = 3) => {
+      for (let i = 0; i < retries; i++) {
+        try {
+          return await bot.telegram.sendMessage(chatId, text, options);
+        } catch (error) {
+          if (i === retries - 1) throw error;
+          await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // Exponential backoff
+        }
+      }
+    };
 
-    // Update user session
+    // Send question with retry
+    const message = await sendMessageWithRetry(
+      `📝 *Question:*\n${escapeMarkdown(questionData.question)}\n\n🔗 [Read full article](${escapeMarkdown(questionData.link)})`,
+      {
+        parse_mode: 'MarkdownV2',
+        ...Markup.inlineKeyboard(questionData.options.map((option, index) => {
+          return [Markup.button.callback(option, `q${quizId}_${questionIndex}_${index}_${userId}`)];
+        })),
+        protect_content: true
+      }
+    );
+
     userSession.lastMessageId = message.message_id;
-    userSession.currentQuizId = quizId;
-    userSession.currentQuestionIndex = questionIndex;
   } catch (error) {
     console.error('Error sending quiz question:', error);
     await bot.telegram.sendMessage(chatId, 
-      'Error sending quiz question\\. Please try again\\.', {
-      parse_mode: 'MarkdownV2',
+      'Error sending quiz question. Please try again.', {
       protect_content: true
-    });
+    }).catch(console.error);
   }
 }
+
+// Add this function to help manage concurrent messages
+const sendMessageQueue = new Map();
+
+const queueMessage = async (chatId, messagePromise) => {
+  if (!sendMessageQueue.has(chatId)) {
+    sendMessageQueue.set(chatId, Promise.resolve());
+  }
+
+  const currentPromise = sendMessageQueue.get(chatId);
+  const newPromise = currentPromise.then(async () => {
+    try {
+      await messagePromise;
+    } catch (error) {
+      console.error('Error sending message:', error);
+    }
+    await new Promise(resolve => setTimeout(resolve, 100)); // Small delay between messages
+  });
+
+  sendMessageQueue.set(chatId, newPromise);
+  return newPromise;
+};
+
+// Use this function when sending multiple messages in sequence
+const sendMultipleMessages = async (chatId, messages) => {
+  for (const message of messages) {
+    await queueMessage(chatId, 
+      bot.telegram.sendMessage(chatId, message.text, message.options)
+        .catch(console.error)
+    );
+  }
+};
 
 // Bot Command Handlers
 const setupBotCommands = (bot) => {
@@ -533,15 +564,48 @@ const initializeBot = () => {
   }
 };
 
-// Export handler for API endpoint
+// Modified export handler with better timeout and response handling
 module.exports = async (req, res) => {
   try {
     await connectToDatabase();
     if (!bot) {
       initializeBot();
     }
+
     if (req.method === 'POST' && process.env.NODE_ENV === 'production') {
-      await bot.handleUpdate(req.body, res);
+      // Set timeout for webhook response
+      const timeoutMs = 10000; // 10 seconds
+      let isResponseSent = false;
+
+      // Create a timeout promise
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => {
+          if (!isResponseSent) {
+            isResponseSent = true;
+            res.status(200).send('OK');
+          }
+          reject(new Error('Webhook timeout'));
+        }, timeoutMs);
+      });
+
+      try {
+        // Race between bot update handling and timeout
+        await Promise.race([
+          bot.handleUpdate(req.body).then(() => {
+            if (!isResponseSent) {
+              isResponseSent = true;
+              res.status(200).send('OK');
+            }
+          }),
+          timeoutPromise
+        ]);
+      } catch (error) {
+        console.error('Webhook processing error:', error);
+        if (!isResponseSent) {
+          isResponseSent = true;
+          res.status(200).send('OK'); // Still send OK to Telegram
+        }
+      }
     } else {
       // For non-POST requests, return status
       res.status(200).json({ 
