@@ -95,7 +95,6 @@ const getUserSession = (userId) => {
 };
 
 
-// Modified sendQuizQuestion function with better message handling
 async function sendQuizQuestion(chatId, quizId, questionIndex, userId) {
   const quiz = quizzes[quizId];
   const questionData = quiz.questions[questionIndex];
@@ -104,40 +103,46 @@ async function sendQuizQuestion(chatId, quizId, questionIndex, userId) {
   if (!quiz || !questionData) {
     await bot.telegram.sendMessage(chatId, 'Error: Quiz or question not found.', {
       protect_content: true
-    }).catch(console.error);
+    });
     return;
   }
 
   try {
     // Delete previous message if it exists
     if (userSession.lastMessageId) {
-      await bot.telegram.deleteMessage(chatId, userSession.lastMessageId)
-        .catch(error => console.log('Could not delete previous message:', error.message));
+      try {
+        await bot.telegram.deleteMessage(chatId, userSession.lastMessageId);
+      } catch (error) {
+        console.log('Could not delete previous message:', error.message);
+      }
     }
 
-    // Send messages with retry logic
-    const sendMessageWithRetry = async (text, options, retries = 3) => {
-      for (let i = 0; i < retries; i++) {
-        try {
-          return await bot.telegram.sendMessage(chatId, text, options);
-        } catch (error) {
-          if (i === retries - 1) throw error;
-          await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // Exponential backoff
-        }
-      }
-    };
+    // Format the question message with better spacing and structure
+    const messageText = [
+      `📝 *Question ${questionIndex + 1}/${quiz.questions.length}*`,
+      "",
+      escapeMarkdown(questionData.question),
+      "",
+      "ℹ️ [Click here to read source article](${escapeMarkdown(questionData.link)})"
+    ].join('\n');
 
-    // Send question with retry
-    const message = await sendMessageWithRetry(
-      `📝 *Question:*\n${escapeMarkdown(questionData.question)}\n\n🔗 [Read full article](${escapeMarkdown(questionData.link)})`,
-      {
-        parse_mode: 'MarkdownV2',
-        ...Markup.inlineKeyboard(questionData.options.map((option, index) => {
-          return [Markup.button.callback(option, `q${quizId}_${questionIndex}_${index}_${userId}`)];
-        })),
-        protect_content: true
+    // Create buttons with shortened text if needed
+    const buttons = questionData.options.map((option, index) => {
+      // Limit button text length and add ellipsis if needed
+      let buttonText = option;
+      if (buttonText.length > 35) { // Telegram button text limit
+        buttonText = buttonText.substring(0, 32) + '...';
       }
-    );
+      
+      return [Markup.button.callback(buttonText, `q${quizId}_${questionIndex}_${index}_${userId}`)];
+    });
+
+    const message = await bot.telegram.sendMessage(chatId, messageText, {
+      parse_mode: 'MarkdownV2',
+      ...Markup.inlineKeyboard(buttons),
+      protect_content: true,
+      disable_web_page_preview: false // Enable link preview
+    });
 
     userSession.lastMessageId = message.message_id;
   } catch (error) {
@@ -145,9 +150,10 @@ async function sendQuizQuestion(chatId, quizId, questionIndex, userId) {
     await bot.telegram.sendMessage(chatId, 
       'Error sending quiz question. Please try again.', {
       protect_content: true
-    }).catch(console.error);
+    });
   }
 }
+
 
 // Add this function to help manage concurrent messages
 const sendMessageQueue = new Map();
