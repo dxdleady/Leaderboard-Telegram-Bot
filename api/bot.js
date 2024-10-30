@@ -79,15 +79,30 @@ const hasUserCompletedQuiz = async (userId) => {
   return !!user;
 };
 
-// Modified sendQuizQuestion function with proper escaping
+// Add this near the top of your file after imports
+const userSessions = new Map();
+
+// Helper function to manage user sessions
+const getUserSession = (userId) => {
+  if (!userSessions.has(userId)) {
+    userSessions.set(userId, {
+      lastMessageId: null,
+      currentQuizId: null,
+      currentQuestionIndex: null
+    });
+  }
+  return userSessions.get(userId);
+};
+
+
+// Modified sendQuizQuestion function to handle multiple users
 async function sendQuizQuestion(chatId, quizId, questionIndex, userId) {
   const quiz = quizzes[quizId];
   const questionData = quiz.questions[questionIndex];
+  const userSession = getUserSession(userId);
 
   if (!quiz || !questionData) {
-    await bot.telegram.sendMessage(chatId, 
-      'Error: Quiz or question not found\\.', {
-      parse_mode: 'MarkdownV2',
+    await bot.telegram.sendMessage(chatId, 'Error: Quiz or question not found.', {
       protect_content: true
     });
     return;
@@ -101,15 +116,15 @@ async function sendQuizQuestion(chatId, quizId, questionIndex, userId) {
 
   // Create inline buttons with proper callback data
   const buttons = questionData.options.map((option, index) => {
-    const callbackData = `q${quizId}_${questionIndex}_${index}`;
+    const callbackData = `q${quizId}_${questionIndex}_${index}_${userId}`;  // Add userId to callback
     return Markup.button.callback(option, callbackData);
   });
 
   try {
-    // Delete previous messages if they exist
-    if (questionData.lastMessageId) {
+    // Delete previous message if it exists
+    if (userSession.lastMessageId) {
       try {
-        await bot.telegram.deleteMessage(chatId, questionData.lastMessageId);
+        await bot.telegram.deleteMessage(chatId, userSession.lastMessageId);
       } catch (error) {
         console.log('Could not delete previous message:', error.message);
       }
@@ -121,7 +136,10 @@ async function sendQuizQuestion(chatId, quizId, questionIndex, userId) {
       protect_content: true
     });
 
-    questionData.lastMessageId = message.message_id;
+    // Update user session
+    userSession.lastMessageId = message.message_id;
+    userSession.currentQuizId = quizId;
+    userSession.currentQuestionIndex = questionIndex;
   } catch (error) {
     console.error('Error sending quiz question:', error);
     await bot.telegram.sendMessage(chatId, 
@@ -359,18 +377,21 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
     }
   });
 
-// Helper function to escape all special characters for MarkdownV2
-const escapeMarkdown = (text) => {
-  return text.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
-};
-
-bot.action(/q(\d+)_(\d+)_(\d+)/, async (ctx) => {
+// Modified action handler to support multiple users
+bot.action(/q(\d+)_(\d+)_(\d+)_(\d+)/, async (ctx) => {
   try {
-    const [_, quizId, questionIndex, answerIndex] = ctx.match;
+    const [_, quizId, questionIndex, answerIndex, userId] = ctx.match;
+    
+    // Verify the user is answering their own question
+    if (parseInt(userId) !== ctx.from.id) {
+      await ctx.answerCbQuery('This is not your quiz question!');
+      return;
+    }
+
+    const userSession = getUserSession(userId);
     const quiz = quizzes[quizId];
     const questionData = quiz.questions[questionIndex];
     const userAnswer = questionData.options[answerIndex];
-    const userId = ctx.from.id;
 
     await ctx.deleteMessage().catch(console.error);
 
@@ -388,57 +409,42 @@ bot.action(/q(\d+)_(\d+)_(\d+)/, async (ctx) => {
         protect_content: true
       });
       
-      // Keep correct answer visible for 5 seconds
       setTimeout(() => {
         ctx.telegram.deleteMessage(ctx.chat.id, correctMessage.message_id)
           .catch(console.error);
       }, 5000);
 
       await userQuizCollection.updateOne(
-        { userId: userId, quizId: parseInt(quizId) },
+        { userId: parseInt(userId), quizId: parseInt(quizId) },
         { $inc: { score: 1 }, $set: { username: ctx.from.username } },
         { upsert: true }
       );
     } else {
-      // For incorrect answers, show two separate messages
-      
-      // First message: Wrong answer notification with correct answer
       const wrongMessage = await ctx.reply([
         "❌ Wrong answer\\!",
-        `The correct answer was:",
-        "${escapeMarkdown(questionData.correct)}"`
-      ].join('\n'), {
-        parse_mode: 'MarkdownV2',
-        protect_content: true
-      });
-
-      // Second message: Source link
-      const linkMessage = await ctx.reply([
-        "Want to learn more?",
+        `The correct answer was: ${escapeMarkdown(questionData.correct)}`,
+        "",
         `🔗 [Read full article](${escapeMarkdown(questionData.link)})`
       ].join('\n'), {
         parse_mode: 'MarkdownV2',
         protect_content: true
       });
       
-      // Keep wrong answer visible for 7 seconds
       setTimeout(() => {
         ctx.telegram.deleteMessage(ctx.chat.id, wrongMessage.message_id)
-          .catch(console.error);
-        ctx.telegram.deleteMessage(ctx.chat.id, linkMessage.message_id)
           .catch(console.error);
       }, 7000);
     }
 
-    // Add a small delay before showing the next question
+    // Add delay before next question
     setTimeout(async () => {
       const nextQuestionIndex = parseInt(questionIndex) + 1;
       if (nextQuestionIndex < quiz.questions.length) {
         await sendQuizQuestion(ctx.chat.id, quizId, nextQuestionIndex, userId);
       } else {
-        // Get user's final score for this quiz
+        // Get user's final score
         const userQuiz = await userQuizCollection.findOne({ 
-          userId: userId, 
+          userId: parseInt(userId), 
           quizId: parseInt(quizId) 
         });
         
@@ -446,7 +452,6 @@ bot.action(/q(\d+)_(\d+)_(\d+)/, async (ctx) => {
         const userScore = userQuiz?.score || 0;
         const scorePercentage = Math.round((userScore / totalQuestions) * 100);
 
-        // Prepare completion message with score and available commands
         const completionText = [
           `🎉 *Quiz Completed\\!*`,
           "",
@@ -468,12 +473,15 @@ bot.action(/q(\d+)_(\d+)_(\d+)/, async (ctx) => {
         });
         
         await userQuizCollection.updateOne(
-          { userId: userId, quizId: parseInt(quizId) },
-          { $set: { completed: true, score: userScore } },
+          { userId: parseInt(userId), quizId: parseInt(quizId) },
+          { $set: { completed: true } },
           { upsert: true }
         );
+
+        // Clear user session after quiz completion
+        userSessions.delete(userId);
       }
-    }, 2000); // Wait 2 seconds before showing next question
+    }, 2000);
 
     await ctx.answerCbQuery();
   } catch (error) {
