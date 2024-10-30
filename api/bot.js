@@ -509,10 +509,10 @@ bot.action(/q(\d+)_(\d+)_(\d+)_(\d+)/, async (ctx) => {
 const initializeBot = () => {
   if (!bot) {
     bot = new Telegraf(config.bot.token);
-    setupBotCommands(bot); // Your existing command setup function
-    
+    setupBotCommands(bot);
+
     if (process.env.NODE_ENV === 'production') {
-      // In production, use webhook
+      // In production, set up webhook
       bot.telegram.setWebhook(`${process.env.API_URL}/api/bot`)
         .then(() => {
           console.log('Webhook set up successfully at:', `${process.env.API_URL}/api/bot`);
@@ -521,7 +521,7 @@ const initializeBot = () => {
           console.error('Error setting webhook:', error);
         });
     } else {
-      // In local development, use long polling
+      // In development, use long polling
       bot.launch()
         .then(() => {
           console.log('Bot launched in long-polling mode for local development');
@@ -537,11 +537,9 @@ const initializeBot = () => {
 module.exports = async (req, res) => {
   try {
     await connectToDatabase();
-
     if (!bot) {
       initializeBot();
     }
-
     if (req.method === 'POST' && process.env.NODE_ENV === 'production') {
       await bot.handleUpdate(req.body, res);
     } else {
@@ -558,6 +556,32 @@ module.exports = async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 };
+
+// Start bot only in development
+if (process.env.NODE_ENV !== 'production') {
+  connectToDatabase()
+    .then(() => {
+      if (process.argv.includes('cleanup')) {
+        console.log("Cleaning database...");
+        const userQuizCollection = mongoose.connection.collection('userQuiz');
+        return userQuizCollection.deleteMany({})
+          .then(result => {
+            console.log(`Cleaned ${result.deletedCount} records from the database.`);
+            return initializeDatabase();
+          })
+          .then(() => {
+            console.log("Database reinitialized with fresh data.");
+            initializeBot();
+          });
+      } else {
+        return initializeBot();
+      }
+    })
+    .catch(error => {
+      console.error('Failed to start bot:', error);
+      process.exit(1);
+    });
+}
 
 // Start bot based on environment
 if (process.env.NODE_ENV !== 'production') {
