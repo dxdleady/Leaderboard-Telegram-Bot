@@ -9,6 +9,7 @@ const mongoose = require('mongoose');
 let bot;
 let isConnected = false;
 
+
 console.log("Bot script started in", process.env.NODE_ENV, "mode");
 
 
@@ -95,6 +96,7 @@ const getUserSession = (userId) => {
 };
 
 
+// Modified sendQuizQuestion function to handle multiple users
 async function sendQuizQuestion(chatId, quizId, questionIndex, userId) {
   const quiz = quizzes[quizId];
   const questionData = quiz.questions[questionIndex];
@@ -107,6 +109,18 @@ async function sendQuizQuestion(chatId, quizId, questionIndex, userId) {
     return;
   }
 
+  const messageText = [
+    `📝 *Question:*\n${escapeMarkdown(questionData.question)}`,
+    "",
+    `🔗 [Read full article](${escapeMarkdown(questionData.link)})`
+  ].join('\n');
+
+  // Create inline buttons with proper callback data
+  const buttons = questionData.options.map((option, index) => {
+    const callbackData = `q${quizId}_${questionIndex}_${index}_${userId}`;  // Add userId to callback
+    return Markup.button.callback(option, callbackData);
+  });
+
   try {
     // Delete previous message if it exists
     if (userSession.lastMessageId) {
@@ -117,75 +131,25 @@ async function sendQuizQuestion(chatId, quizId, questionIndex, userId) {
       }
     }
 
-    // Format the question message with better spacing and structure
-    const messageText = [
-      `📝 *Question ${questionIndex + 1}/${quiz.questions.length}*`,
-      "",
-      escapeMarkdown(questionData.question),
-      "",
-      "ℹ️ [Click here to read source article](${escapeMarkdown(questionData.link)})"
-    ].join('\n');
-
-    // Create buttons with shortened text if needed
-    const buttons = questionData.options.map((option, index) => {
-      // Limit button text length and add ellipsis if needed
-      let buttonText = option;
-      if (buttonText.length > 35) { // Telegram button text limit
-        buttonText = buttonText.substring(0, 32) + '...';
-      }
-      
-      return [Markup.button.callback(buttonText, `q${quizId}_${questionIndex}_${index}_${userId}`)];
-    });
-
     const message = await bot.telegram.sendMessage(chatId, messageText, {
       parse_mode: 'MarkdownV2',
-      ...Markup.inlineKeyboard(buttons),
-      protect_content: true,
-      disable_web_page_preview: false // Enable link preview
+      ...Markup.inlineKeyboard(buttons.map(button => [button])),
+      protect_content: true
     });
 
+    // Update user session
     userSession.lastMessageId = message.message_id;
+    userSession.currentQuizId = quizId;
+    userSession.currentQuestionIndex = questionIndex;
   } catch (error) {
     console.error('Error sending quiz question:', error);
     await bot.telegram.sendMessage(chatId, 
-      'Error sending quiz question. Please try again.', {
+      'Error sending quiz question\\. Please try again\\.', {
+      parse_mode: 'MarkdownV2',
       protect_content: true
     });
   }
 }
-
-
-// Add this function to help manage concurrent messages
-const sendMessageQueue = new Map();
-
-const queueMessage = async (chatId, messagePromise) => {
-  if (!sendMessageQueue.has(chatId)) {
-    sendMessageQueue.set(chatId, Promise.resolve());
-  }
-
-  const currentPromise = sendMessageQueue.get(chatId);
-  const newPromise = currentPromise.then(async () => {
-    try {
-      await messagePromise;
-    } catch (error) {
-      console.error('Error sending message:', error);
-    }
-    await new Promise(resolve => setTimeout(resolve, 100)); // Small delay between messages
-  });
-
-  sendMessageQueue.set(chatId, newPromise);
-  return newPromise;
-};
-
-// Use this function when sending multiple messages in sequence
-const sendMultipleMessages = async (chatId, messages) => {
-  for (const message of messages) {
-    await queueMessage(chatId, 
-      bot.telegram.sendMessage(chatId, message.text, message.options)
-        .catch(console.error)
-    );
-  }
-};
 
 // Bot Command Handlers
 const setupBotCommands = (bot) => {
@@ -570,48 +534,15 @@ const initializeBot = () => {
   }
 };
 
-// Modified export handler with better timeout and response handling
+// Export handler for API endpoint
 module.exports = async (req, res) => {
   try {
     await connectToDatabase();
     if (!bot) {
       initializeBot();
     }
-
     if (req.method === 'POST' && process.env.NODE_ENV === 'production') {
-      // Set timeout for webhook response
-      const timeoutMs = 10000; // 10 seconds
-      let isResponseSent = false;
-
-      // Create a timeout promise
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => {
-          if (!isResponseSent) {
-            isResponseSent = true;
-            res.status(200).send('OK');
-          }
-          reject(new Error('Webhook timeout'));
-        }, timeoutMs);
-      });
-
-      try {
-        // Race between bot update handling and timeout
-        await Promise.race([
-          bot.handleUpdate(req.body).then(() => {
-            if (!isResponseSent) {
-              isResponseSent = true;
-              res.status(200).send('OK');
-            }
-          }),
-          timeoutPromise
-        ]);
-      } catch (error) {
-        console.error('Webhook processing error:', error);
-        if (!isResponseSent) {
-          isResponseSent = true;
-          res.status(200).send('OK'); // Still send OK to Telegram
-        }
-      }
+      await bot.handleUpdate(req.body, res);
     } else {
       // For non-POST requests, return status
       res.status(200).json({ 
