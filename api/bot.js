@@ -23,39 +23,38 @@ const initializeBot = () => {
     setupActionHandlers(bot);
 
     if (process.env.NODE_ENV === 'production') {
-      // Get the actual deployment URL from environment variables
-      const domain = process.env.VERCEL_URL || process.env.API_URL;
-      const webhookUrl = `https://${domain}/api/bot`;
+      // Use the actual domain
+      const domain = process.env.VERCEL_URL;
+      if (!domain) {
+        throw new Error('VERCEL_URL environment variable is not set');
+      }
 
-      console.log('Current webhook URL:', webhookUrl); // For debugging
+      const webhookUrl = `https://${domain}/api/bot`;
+      console.log('Setting webhook URL:', webhookUrl);
 
       bot.telegram
         .deleteWebhook()
         .then(() => {
-          return bot.telegram.setWebhook(webhookUrl, {
-            allowed_updates: ['message', 'callback_query'],
-            drop_pending_updates: true,
-            max_connections: 100,
-          });
+          return bot.telegram.setWebhook(webhookUrl);
         })
         .then(() => {
-          console.log('Webhook set up successfully');
+          console.log('Webhook set successfully');
           return bot.telegram.getWebhookInfo();
         })
         .then(info => {
           console.log('Webhook info:', info);
         })
         .catch(error => {
-          console.error('Error setting webhook:', error);
+          console.error('Webhook setup error:', error);
         });
     } else {
       bot
         .launch()
         .then(() => {
-          console.log('Bot launched in long-polling mode');
+          console.log('Bot launched in polling mode');
         })
         .catch(error => {
-          console.error('Error launching bot:', error);
+          console.error('Launch error:', error);
         });
     }
   }
