@@ -19,14 +19,15 @@ let bot;
 const initializeBot = () => {
   if (!bot) {
     bot = new Telegraf(config.bot.token);
-
-    // Set up both command and action handlers
-    setupCommandHandlers(bot); // Add this line
+    setupCommandHandlers(bot);
     setupActionHandlers(bot);
 
     if (process.env.NODE_ENV === 'production') {
-      const webhookUrl = `${process.env.API_URL}/api/bot`;
-      console.log('Setting webhook to:', webhookUrl);
+      // Get the actual deployment URL from environment variables
+      const domain = process.env.VERCEL_URL || process.env.API_URL;
+      const webhookUrl = `https://${domain}/api/bot`;
+
+      console.log('Current webhook URL:', webhookUrl); // For debugging
 
       bot.telegram
         .deleteWebhook()
@@ -48,14 +49,6 @@ const initializeBot = () => {
           console.error('Error setting webhook:', error);
         });
     } else {
-      // For development mode, add error handler before launch
-      bot.catch((err, ctx) => {
-        console.error('Bot error:', err);
-        ctx
-          .reply('An error occurred. Please try again.')
-          .catch(e => console.error('Error sending error message:', e));
-      });
-
       bot
         .launch()
         .then(() => {
