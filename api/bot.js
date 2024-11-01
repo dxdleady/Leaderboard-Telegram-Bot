@@ -42,23 +42,40 @@ const initializeDatabase = async () => {
   }
 };
 
-// Remove all the duplicate initialization code and keep only this version:
+// Modified initializeBot function
 const initializeBot = () => {
   if (!bot) {
     bot = new Telegraf(config.bot.token);
     setupBotCommands(bot);
 
     if (process.env.NODE_ENV === 'production') {
-      // In production, use webhook
-      bot.telegram.setWebhook(`${process.env.API_URL}/api/bot`)
+      // Make sure webhook URL is correct
+      const webhookUrl = `${process.env.API_URL}/api/bot`;
+      console.log('Setting webhook to:', webhookUrl);
+      
+      // Remove any existing webhook first
+      bot.telegram.deleteWebhook()
         .then(() => {
-          console.log('Webhook set up successfully at:', `${process.env.API_URL}/api/bot`);
+          // Set up new webhook with proper configuration
+          return bot.telegram.setWebhook(webhookUrl, {
+            allowed_updates: ['message', 'callback_query'],
+            drop_pending_updates: true,
+            max_connections: 100
+          });
+        })
+        .then(() => {
+          console.log('Webhook set up successfully');
+          // Verify webhook info
+          return bot.telegram.getWebhookInfo();
+        })
+        .then((info) => {
+          console.log('Webhook info:', info);
         })
         .catch(error => {
           console.error('Error setting webhook:', error);
         });
     } else {
-      // In development, use long polling
+      // Local development - use long polling
       bot.launch()
         .then(() => {
           console.log('Bot launched in long-polling mode for local development');
@@ -70,6 +87,7 @@ const initializeBot = () => {
   }
   return bot;
 };
+
 
 
 // Function to clear leaderboard data
@@ -537,86 +555,41 @@ bot.action(/q(\d+)_(\d+)_(\d+)_(\d+)/, async (ctx) => {
   });
 };
 
-// Export handler for API endpoint
-module.exports = async (req, res) => {
-  try {
-    await connectToDatabase();
-    if (!bot) {
-      initializeBot();
-    }
-    if (req.method === 'POST' && process.env.NODE_ENV === 'production') {
-      await bot.handleUpdate(req.body, res);
-    } else {
-      // For non-POST requests, return status
-      res.status(200).json({ 
-        status: 'Bot is running',
-        mode: process.env.NODE_ENV === 'production' ? 'webhook' : 'polling',
-        environment: process.env.NODE_ENV,
-        timestamp: new Date().toISOString()
-      });
-    }
-  } catch (error) {
-    console.error('Error in bot handler:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-};
 
-// Improved webhook handler
+// Modified webhook handler
 module.exports = async (req, res) => {
   try {
+    console.log('Received webhook request:', req.method);
+    
     await connectToDatabase();
     
-    // Initialize bot if not already initialized
     if (!bot) {
       bot = initializeBot();
     }
 
-    if (req.method === 'POST' && process.env.NODE_ENV === 'production') {
-      // Set a timeout for the webhook response
-      const timeoutMs = 10000;
-      let isResponseSent = false;
-
-      // Create a timeout promise
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => {
-          if (!isResponseSent) {
-            isResponseSent = true;
-            res.status(200).json({ ok: true });
-          }
-          reject(new Error('Webhook timeout'));
-        }, timeoutMs);
-      });
-
-      try {
-        // Race between bot update handling and timeout
-        await Promise.race([
-          bot.handleUpdate(req.body).then(() => {
-            if (!isResponseSent) {
-              isResponseSent = true;
-              res.status(200).json({ ok: true });
-            }
-          }),
-          timeoutPromise
-        ]);
-      } catch (error) {
-        console.error('Webhook processing error:', error);
-        if (!isResponseSent) {
-          isResponseSent = true;
-          res.status(200).json({ ok: true }); // Still send OK to Telegram
-        }
-      }
+    if (req.method === 'POST') {
+      console.log('Processing update from Telegram');
+      
+      // Handle the update
+      await bot.handleUpdate(req.body);
+      
+      // Always send a 200 OK response quickly
+      res.status(200).json({ ok: true });
     } else {
       // Health check endpoint
-      res.status(200).json({ 
+      const webhookInfo = await bot.telegram.getWebhookInfo();
+      res.status(200).json({
         status: 'Bot is running',
         mode: process.env.NODE_ENV === 'production' ? 'webhook' : 'polling',
         environment: process.env.NODE_ENV,
+        webhook: webhookInfo,
         timestamp: new Date().toISOString()
       });
     }
   } catch (error) {
-    console.error('Error in bot handler:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Error in webhook handler:', error);
+    // Still send 200 to Telegram even on error
+    res.status(200).json({ ok: true });
   }
 };
 

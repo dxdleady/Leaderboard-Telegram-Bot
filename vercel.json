@@ -10,9 +10,11 @@
     {
       "src": "/api/bot",
       "dest": "/api/bot.js",
-      "methods": ["POST", "GET"],
+      "methods": ["POST", "GET", "OPTIONS"],
       "headers": {
-        "Access-Control-Allow-Origin": "*"
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type"
       }
     }
   ],
