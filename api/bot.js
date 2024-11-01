@@ -5,7 +5,7 @@ require('dotenv').config({
 const { Telegraf } = require('telegraf');
 const mongoose = require('mongoose');
 const config = require('../config/default');
-const webhookHandler = require('../handlers/webhookHandlers');
+const webhookHandler = require('../handlers/webhookHandler');
 const {
   connectToDatabase,
   initializeDatabase,
@@ -16,86 +16,87 @@ const { setupActionHandlers } = require('../handlers/actionHandlers');
 
 let bot;
 
-const initializeBot = async () => {
+const initializeBot = () => {
   if (!bot) {
     bot = new Telegraf(config.bot.token);
 
-    // Setup handlers
-    setupCommandHandlers(bot);
+    // Set up both command and action handlers
+    setupCommandHandlers(bot); // Add this line
     setupActionHandlers(bot);
 
     if (process.env.NODE_ENV === 'production') {
-      // Get the actual deployment URL from environment
-      const webhookUrl = `${
-        process.env.VERCEL_URL || process.env.API_URL
-      }/api/bot`;
+      const webhookUrl = `${process.env.API_URL}/api/bot`;
       console.log('Setting webhook to:', webhookUrl);
 
-      try {
-        // First, remove any existing webhook
-        await bot.telegram.deleteWebhook();
-
-        // Set the new webhook
-        await bot.telegram.setWebhook(webhookUrl, {
-          allowed_updates: ['message', 'callback_query'],
-          drop_pending_updates: true,
+      bot.telegram
+        .deleteWebhook()
+        .then(() => {
+          return bot.telegram.setWebhook(webhookUrl, {
+            allowed_updates: ['message', 'callback_query'],
+            drop_pending_updates: true,
+            max_connections: 100,
+          });
+        })
+        .then(() => {
+          console.log('Webhook set up successfully');
+          return bot.telegram.getWebhookInfo();
+        })
+        .then(info => {
+          console.log('Webhook info:', info);
+        })
+        .catch(error => {
+          console.error('Error setting webhook:', error);
         });
-
-        // Verify webhook setup
-        const webhookInfo = await bot.telegram.getWebhookInfo();
-        console.log('Webhook info:', webhookInfo);
-
-        // Add some verification
-        if (webhookInfo.url !== webhookUrl) {
-          console.warn(
-            `Warning: Webhook URL mismatch. Expected: ${webhookUrl}, Got: ${webhookInfo.url}`
-          );
-        }
-      } catch (error) {
-        console.error('Error setting webhook:', error);
-        throw error;
-      }
     } else {
-      // Local development - use polling
-      await bot.launch();
-      console.log('Bot launched in polling mode for development');
+      // For development mode, add error handler before launch
+      bot.catch((err, ctx) => {
+        console.error('Bot error:', err);
+        ctx
+          .reply('An error occurred. Please try again.')
+          .catch(e => console.error('Error sending error message:', e));
+      });
+
+      bot
+        .launch()
+        .then(() => {
+          console.log('Bot launched in long-polling mode');
+        })
+        .catch(error => {
+          console.error('Error launching bot:', error);
+        });
     }
   }
   return bot;
 };
 
-// Modify the export handler
+// Development mode startup
+if (process.env.NODE_ENV !== 'production') {
+  connectToDatabase()
+    .then(async () => {
+      if (process.argv.includes('cleanup')) {
+        console.log('Cleaning database...');
+        await clearDatabase();
+        await initializeDatabase();
+        console.log('Database reinitialized with fresh data.');
+      }
+      return initializeBot();
+    })
+    .catch(error => {
+      console.error('Failed to start bot:', error);
+      process.exit(1);
+    });
+}
+
+// Export handler for API endpoint
 module.exports = async (req, res) => {
   try {
-    console.log('Received webhook request:', req.method, req.url);
-
     await connectToDatabase();
-
     if (!bot) {
-      await initializeBot();
+      initializeBot();
     }
-
-    if (req.method === 'POST') {
-      // Log the update for debugging
-      console.log('Update received:', JSON.stringify(req.body, null, 2));
-
-      // Process the update
-      await bot.handleUpdate(req.body);
-
-      // Send response
-      res.status(200).json({ ok: true });
-    } else {
-      // Health check
-      const webhookInfo = await bot.telegram.getWebhookInfo();
-      res.status(200).json({
-        status: 'ok',
-        timestamp: new Date().toISOString(),
-        webhook: webhookInfo,
-      });
-    }
+    return webhookHandler(req, res, bot);
   } catch (error) {
-    console.error('Error in webhook handler:', error);
-    // Still send 200 to Telegram
-    res.status(200).json({ ok: true });
+    console.error('Error in API handler:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 };

@@ -1,3 +1,5 @@
+const mongoose = require('mongoose');
+
 const activeConnections = new Map();
 
 const manageConnection = async (userId, action) => {

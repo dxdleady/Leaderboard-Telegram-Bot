@@ -4,9 +4,10 @@ const { hasUserCompletedQuiz } = require('../services/database');
 const { sendQuizQuestion } = require('../handlers/actionHandlers');
 const { quizzes } = require('../config/quizData');
 const mongoose = require('mongoose');
+const config = require('../config/default'); // Add this import
 
 const setupCommandHandlers = bot => {
-  // Start Command
+  // Keep only one start command handler
   bot.command('start', async ctx => {
     try {
       const hasCompleted = await hasUserCompletedQuiz(ctx.from.id);
@@ -27,57 +28,6 @@ Let's test that with our first Trivia Quiz!
 You have until Monday, October 14th, to get a perfect score and be entered into the drawing pool to win 50 $SUI tokens!
 Good luck, Seekers, and don't forget to follow us on X and Telegram to stay updated on our upcoming events! #News2Earn
       `.trim();
-
-      const latestQuizId = getLatestQuizId();
-
-      await ctx.replyWithPhoto(
-        {
-          url: 'https://drive.google.com/uc?id=1d4bbmOQWryf1QXzRg5rfP7YKWSd0QuKn',
-        },
-        {
-          caption: welcomeMessage,
-          protect_content: true,
-          reply_markup: {
-            inline_keyboard: [
-              [
-                {
-                  text: '🎮 Start Quiz',
-                  callback_data: `start_quiz_${latestQuizId}`,
-                },
-              ],
-            ],
-          },
-        }
-      );
-    } catch (error) {
-      console.error('Error in start command:', error);
-      await ctx.reply(
-        'Sorry, there was an error starting the quiz. Please try again.'
-      );
-    }
-  });
-
-  // Start Command
-  bot.command('start', async ctx => {
-    try {
-      const hasCompleted = await hasUserCompletedQuiz(ctx.from.id);
-      if (hasCompleted) {
-        await ctx.reply(
-          'You have already participated in this quiz. Good luck!',
-          {
-            protect_content: true,
-          }
-        );
-        return;
-      }
-
-      const welcomeMessage = `
-Seekers, have you been following our news and Alpha recently?
-Let's test that with our first Trivia Quiz!
-
-You have until Monday, October 14th, to get a perfect score and be entered into the drawing pool to win 50 $SUI tokens!
-Good luck, Seekers, and don't forget to follow us on X and Telegram to stay updated on our upcoming events! #News2Earn
-    `.trim();
 
       const latestQuizId = getLatestQuizId();
 
