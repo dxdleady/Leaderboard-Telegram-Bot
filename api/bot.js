@@ -42,6 +42,36 @@ const initializeDatabase = async () => {
   }
 };
 
+// Remove all the duplicate initialization code and keep only this version:
+const initializeBot = () => {
+  if (!bot) {
+    bot = new Telegraf(config.bot.token);
+    setupBotCommands(bot);
+
+    if (process.env.NODE_ENV === 'production') {
+      // In production, use webhook
+      bot.telegram.setWebhook(`${process.env.API_URL}/api/bot`)
+        .then(() => {
+          console.log('Webhook set up successfully at:', `${process.env.API_URL}/api/bot`);
+        })
+        .catch(error => {
+          console.error('Error setting webhook:', error);
+        });
+    } else {
+      // In development, use long polling
+      bot.launch()
+        .then(() => {
+          console.log('Bot launched in long-polling mode for local development');
+        })
+        .catch(error => {
+          console.error('Error launching bot:', error);
+        });
+    }
+  }
+  return bot;
+};
+
+
 // Function to clear leaderboard data
 const clearLeaderboard = async () => {
   try {
@@ -507,33 +537,6 @@ bot.action(/q(\d+)_(\d+)_(\d+)_(\d+)/, async (ctx) => {
   });
 };
 
-const initializeBot = () => {
-  if (!bot) {
-    bot = new Telegraf(config.bot.token);
-    setupBotCommands(bot);
-
-    if (process.env.NODE_ENV === 'production') {
-      // In production, set up webhook
-      bot.telegram.setWebhook(`${process.env.API_URL}/api/bot`)
-        .then(() => {
-          console.log('Webhook set up successfully at:', `${process.env.API_URL}/api/bot`);
-        })
-        .catch(error => {
-          console.error('Error setting webhook:', error);
-        });
-    } else {
-      // In development, use long polling
-      bot.launch()
-        .then(() => {
-          console.log('Bot launched in long-polling mode for local development');
-        })
-        .catch(error => {
-          console.error('Error launching bot:', error);
-        });
-    }
-  }
-};
-
 // Export handler for API endpoint
 module.exports = async (req, res) => {
   try {
@@ -558,87 +561,89 @@ module.exports = async (req, res) => {
   }
 };
 
-// Start bot only in development
-if (process.env.NODE_ENV !== 'production') {
-  connectToDatabase()
-    .then(() => {
-      if (process.argv.includes('cleanup')) {
-        console.log("Cleaning database...");
-        const userQuizCollection = mongoose.connection.collection('userQuiz');
-        return userQuizCollection.deleteMany({})
-          .then(result => {
-            console.log(`Cleaned ${result.deletedCount} records from the database.`);
-            return initializeDatabase();
-          })
-          .then(() => {
-            console.log("Database reinitialized with fresh data.");
-            initializeBot();
-          });
-      } else {
-        return initializeBot();
-      }
-    })
-    .catch(error => {
-      console.error('Failed to start bot:', error);
-      process.exit(1);
-    });
-}
-
-// Start bot based on environment
-if (process.env.NODE_ENV !== 'production') {
-  // Only start the bot directly in non-production environment
-  connectToDatabase()
-    .then(() => {
-      if (process.argv.includes('cleanup')) {
-        console.log("Cleaning database...");
-        const userQuizCollection = mongoose.connection.collection('userQuiz');
-        return userQuizCollection.deleteMany({})
-          .then(result => {
-            console.log(`Cleaned ${result.deletedCount} records from the database.`);
-            return initializeDatabase();
-          })
-          .then(() => {
-            console.log("Database reinitialized with fresh data.");
-            initializeBot();
-          });
-      } else {
-        return initializeBot();
-      }
-    })
-    .catch(error => {
-      console.error('Failed to start bot:', error);
-      process.exit(1);
-    });
-}
-// Modified startBot function to clean sample data
-const startBot = async () => {
-  console.log("Starting bot in", process.env.NODE_ENV, "mode");
-  
-  await connectToDatabase();
-  
-  // Check if cleanup flag is present
-  if (process.argv.includes('cleanup')) {
-    try {
-      console.log("Cleaning database...");
-      const userQuizCollection = mongoose.connection.collection('userQuiz');
-      const result = await userQuizCollection.deleteMany({});
-      console.log(`Cleaned ${result.deletedCount} records from the database.`);
-      
-      // Initialize database without sample data
-      await initializeDatabase();
-      console.log("Database reinitialized.");
-    } catch (error) {
-      console.error("Error during cleanup:", error);
-      process.exit(1);
+// Improved webhook handler
+module.exports = async (req, res) => {
+  try {
+    await connectToDatabase();
+    
+    // Initialize bot if not already initialized
+    if (!bot) {
+      bot = initializeBot();
     }
-  } else {
-    // Always clean sample data on regular start
-    await clearLeaderboard();
+
+    if (req.method === 'POST' && process.env.NODE_ENV === 'production') {
+      // Set a timeout for the webhook response
+      const timeoutMs = 10000;
+      let isResponseSent = false;
+
+      // Create a timeout promise
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => {
+          if (!isResponseSent) {
+            isResponseSent = true;
+            res.status(200).json({ ok: true });
+          }
+          reject(new Error('Webhook timeout'));
+        }, timeoutMs);
+      });
+
+      try {
+        // Race between bot update handling and timeout
+        await Promise.race([
+          bot.handleUpdate(req.body).then(() => {
+            if (!isResponseSent) {
+              isResponseSent = true;
+              res.status(200).json({ ok: true });
+            }
+          }),
+          timeoutPromise
+        ]);
+      } catch (error) {
+        console.error('Webhook processing error:', error);
+        if (!isResponseSent) {
+          isResponseSent = true;
+          res.status(200).json({ ok: true }); // Still send OK to Telegram
+        }
+      }
+    } else {
+      // Health check endpoint
+      res.status(200).json({ 
+        status: 'Bot is running',
+        mode: process.env.NODE_ENV === 'production' ? 'webhook' : 'polling',
+        environment: process.env.NODE_ENV,
+        timestamp: new Date().toISOString()
+      });
+    }
+  } catch (error) {
+    console.error('Error in bot handler:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
-  
-  initializeBot();
-  console.log("Bot started in", process.env.NODE_ENV, "mode");
 };
+
+// Development mode startup
+if (process.env.NODE_ENV !== 'production') {
+  connectToDatabase()
+    .then(() => {
+      if (process.argv.includes('cleanup')) {
+        console.log("Cleaning database...");
+        const userQuizCollection = mongoose.connection.collection('userQuiz');
+        return userQuizCollection.deleteMany({})
+          .then(result => {
+            console.log(`Cleaned ${result.deletedCount} records from the database.`);
+            return initializeDatabase();
+          })
+          .then(() => {
+            initializeBot();
+          });
+      } else {
+        return initializeBot();
+      }
+    })
+    .catch(error => {
+      console.error('Failed to start bot:', error);
+      process.exit(1);
+    });
+}
 
 // Quiz Data
 const quizzes = {
@@ -698,18 +703,3 @@ const quizzes = {
     ]
   }
 };
-
-// // Start the bot
-// startBot();
-
-// // Export for API usage if needed
-// module.exports = async (req, res) => {
-//   await connectToDatabase();
-//   initializeBot();
-
-//   if (req.method === 'POST') {
-//     await bot.handleUpdate(req.body, res);
-//   } else {
-//     res.status(200).send("Bot is running");
-//   }
-// };
