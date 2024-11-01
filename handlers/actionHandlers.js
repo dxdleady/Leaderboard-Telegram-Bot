@@ -1,4 +1,3 @@
-const PQueue = require('p-queue').default;
 const { escapeMarkdown } = require('../utils/helpers');
 const {
   userSessions,
@@ -9,26 +8,54 @@ const { quizzes } = require('../config/quizData');
 const { Markup } = require('telegraf');
 const mongoose = require('mongoose');
 
-// Create queues for each user
-const userQueues = new Map();
+// Single message queue implementation
+const messageQueues = new Map();
 
-// Get or create queue for user
-const getUserQueue = userId => {
-  if (!userQueues.has(userId)) {
-    userQueues.set(userId, new PQueue({ concurrency: 1 }));
+// Helper function to manage message queue
+const queueMessage = async (userId, action) => {
+  if (!messageQueues.has(userId)) {
+    messageQueues.set(userId, Promise.resolve());
   }
-  return userQueues.get(userId);
+
+  const queue = messageQueues.get(userId);
+  const newPromise = queue.then(async () => {
+    try {
+      await action();
+      // Small delay between messages
+      await new Promise(resolve => setTimeout(resolve, 500));
+    } catch (error) {
+      console.error('Error in queued message:', error);
+    }
+  });
+
+  messageQueues.set(userId, newPromise);
+  return newPromise;
+};
+
+// Clear queue for user
+const clearUserQueue = userId => {
+  messageQueues.delete(userId);
+};
+
+// Safe message deletion
+const safeDeleteMessage = async (bot, chatId, messageId) => {
+  if (!messageId) return;
+  try {
+    await bot.telegram.deleteMessage(chatId, messageId);
+  } catch (error) {
+    if (!error.message.includes('message to delete not found')) {
+      console.error('Error deleting message:', error);
+    }
+  }
 };
 
 async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
-  const queue = getUserQueue(userId);
+  const userSession = getUserSession(userId);
+  const quiz = quizzes[quizId];
+  const questionData = quiz.questions[questionIndex];
 
-  await queue.add(async () => {
+  await queueMessage(userId, async () => {
     try {
-      const quiz = quizzes[quizId];
-      const questionData = quiz.questions[questionIndex];
-      const userSession = getUserSession(userId);
-
       if (!quiz || !questionData) {
         await bot.telegram.sendMessage(
           chatId,
@@ -38,6 +65,11 @@ async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
           }
         );
         return;
+      }
+
+      // Delete previous message if exists
+      if (userSession.lastMessageId) {
+        await safeDeleteMessage(bot, chatId, userSession.lastMessageId);
       }
 
       const messageText = [
@@ -60,76 +92,80 @@ async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
       });
 
       userSession.lastMessageId = message.message_id;
+      userSession.currentQuizId = quizId;
+      userSession.currentQuestionIndex = questionIndex;
     } catch (error) {
       console.error('Error sending quiz question:', error);
+      clearUserQueue(userId);
       await bot.telegram.sendMessage(
         chatId,
-        'Error sending quiz question. Please try /start again.',
-        {
-          protect_content: true,
-        }
+        'Error sending quiz question. Please try /start to begin again.',
+        { protect_content: true }
       );
     }
   });
 }
 
 const setupActionHandlers = bot => {
+  // Quiz start action
   bot.action(/^start_quiz_(\d+)$/, async ctx => {
-    const userId = ctx.from.id;
-    const queue = getUserQueue(userId);
+    try {
+      const quizId = ctx.match[1];
+      const userId = ctx.from.id;
+      const chatId = ctx.chat.id;
 
-    await queue.add(async () => {
-      try {
-        const quizId = ctx.match[1];
-        const chatId = ctx.chat.id;
+      if (await hasUserCompletedQuiz(userId)) {
+        await ctx.answerCbQuery('You have already completed this quiz!');
+        return;
+      }
 
-        if (await hasUserCompletedQuiz(userId)) {
-          await ctx.answerCbQuery('You have already completed this quiz!');
-          return;
-        }
+      await ctx.deleteMessage().catch(console.error);
 
-        await ctx.deleteMessage().catch(console.error);
+      const quiz = quizzes[quizId];
+      if (!quiz) {
+        await ctx.reply('Sorry, this quiz is no longer available.', {
+          protect_content: true,
+        });
+        return;
+      }
 
-        const quiz = quizzes[quizId];
-        if (!quiz) {
-          await ctx.reply('Sorry, this quiz is no longer available.', {
-            protect_content: true,
-          });
-          return;
-        }
-
+      await queueMessage(userId, async () => {
         await ctx.reply(`Starting quiz: ${quiz.title}`, {
           protect_content: true,
         });
+      });
 
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        await sendQuizQuestion(bot, chatId, quizId, 0, userId);
-        await ctx.answerCbQuery();
-      } catch (error) {
-        console.error('Error starting quiz:', error);
-        await ctx.answerCbQuery('Error starting quiz. Please try again.');
-      }
-    });
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      await sendQuizQuestion(bot, chatId, quizId, 0, userId);
+      await ctx.answerCbQuery();
+    } catch (error) {
+      console.error('Error handling start quiz button:', error);
+      await ctx.answerCbQuery('Error starting quiz. Please try again.');
+    }
   });
 
+  // Quiz answer action
   bot.action(/q(\d+)_(\d+)_(\d+)_(\d+)/, async ctx => {
-    const userId = ctx.from.id;
-    const queue = getUserQueue(userId);
+    try {
+      const [_, quizId, questionIndex, answerIndex, userId] = ctx.match;
+      const chatId = ctx.chat.id;
 
-    await queue.add(async () => {
-      try {
-        const [_, quizId, questionIndex, answerIndex] = ctx.match;
-        const chatId = ctx.chat.id;
+      if (parseInt(userId) !== ctx.from.id) {
+        await ctx.answerCbQuery('This is not your quiz question!');
+        return;
+      }
 
-        const quiz = quizzes[quizId];
-        const questionData = quiz.questions[questionIndex];
-        const userAnswer = questionData.options[answerIndex];
+      clearUserQueue(userId);
+      const quiz = quizzes[quizId];
+      const questionData = quiz.questions[questionIndex];
+      const userAnswer = questionData.options[answerIndex];
 
-        await ctx.deleteMessage().catch(console.error);
-        const userQuizCollection = mongoose.connection.collection('userQuiz');
+      await ctx.deleteMessage().catch(console.error);
+      const userQuizCollection = mongoose.connection.collection('userQuiz');
 
+      await queueMessage(userId, async () => {
         if (userAnswer === questionData.correct) {
-          await ctx.reply(
+          const msg = await ctx.reply(
             `✅ Correct answer! 🎉\n\n🔗 Read full article: ${questionData.link}`,
             { protect_content: true }
           );
@@ -139,77 +175,90 @@ const setupActionHandlers = bot => {
             { $inc: { score: 1 }, $set: { username: ctx.from.username } },
             { upsert: true }
           );
+
+          setTimeout(
+            () => safeDeleteMessage(bot, chatId, msg.message_id),
+            3000
+          );
         } else {
-          await ctx.reply(
+          const msg = await ctx.reply(
             `❌ Wrong answer!\nThe correct answer was: ${questionData.correct}\n\n🔗 Read full article: ${questionData.link}`,
             { protect_content: true }
           );
+
+          setTimeout(
+            () => safeDeleteMessage(bot, chatId, msg.message_id),
+            3000
+          );
         }
+      });
 
-        await new Promise(resolve => setTimeout(resolve, 2000));
+      await new Promise(resolve => setTimeout(resolve, 3000));
 
-        const nextQuestionIndex = parseInt(questionIndex) + 1;
-        if (nextQuestionIndex < quiz.questions.length) {
-          await sendQuizQuestion(
-            bot,
-            chatId,
-            quizId,
-            nextQuestionIndex,
-            userId
-          );
-        } else {
-          // Quiz completion
-          const userQuiz = await userQuizCollection.findOne({
-            userId: parseInt(userId),
-            quizId: parseInt(quizId),
-          });
+      const nextQuestionIndex = parseInt(questionIndex) + 1;
+      if (nextQuestionIndex < quiz.questions.length) {
+        await sendQuizQuestion(bot, chatId, quizId, nextQuestionIndex, userId);
+      } else {
+        const userQuiz = await userQuizCollection.findOne({
+          userId: parseInt(userId),
+          quizId: parseInt(quizId),
+        });
 
-          const totalQuestions = quiz.questions.length;
-          const userScore = userQuiz?.score || 0;
-          const scorePercentage = Math.round(
-            (userScore / totalQuestions) * 100
-          );
+        const totalQuestions = quiz.questions.length;
+        const userScore = userQuiz?.score || 0;
+        const scorePercentage = Math.round((userScore / totalQuestions) * 100);
 
-          const completionText = [
-            '🎉 *Quiz Completed\\!*',
-            '',
-            '📊 *Your Results:*',
-            `✓ Score: ${userScore}/${totalQuestions} \\(${scorePercentage}%\\)`,
-            scorePercentage === 100
-              ? "🏆 Perfect Score\\! You're eligible for the prize draw\\!"
-              : 'Keep trying to get a perfect score\\!',
-            '',
-            '📋 *Available Commands:*',
-            '/help \\- Show all available commands',
-            '/listquizzes \\- Show available quizzes',
-            '/leaderboard \\- View top 10 players',
-          ].join('\n');
+        const completionText = [
+          '🎉 *Quiz Completed\\!*',
+          '',
+          '📊 *Your Results:*',
+          `✓ Score: ${userScore}/${totalQuestions} \\(${scorePercentage}%\\)`,
+          scorePercentage === 100
+            ? "🏆 Perfect Score\\! You're eligible for the prize draw\\!"
+            : 'Keep trying to get a perfect score\\!',
+          '',
+          '📋 *Available Commands:*',
+          '/help \\- Show all available commands',
+          '/listquizzes \\- Show available quizzes',
+          '/leaderboard \\- View top 10 players',
+        ].join('\n');
 
-          await ctx.reply(completionText, {
-            parse_mode: 'MarkdownV2',
-            protect_content: true,
-          });
+        await ctx.reply(completionText, {
+          parse_mode: 'MarkdownV2',
+          protect_content: true,
+        });
 
-          await userQuizCollection.updateOne(
-            { userId: parseInt(userId), quizId: parseInt(quizId) },
-            { $set: { completed: true } },
-            { upsert: true }
-          );
+        await userQuizCollection.updateOne(
+          { userId: parseInt(userId), quizId: parseInt(quizId) },
+          { $set: { completed: true } },
+          { upsert: true }
+        );
 
-          userQueues.delete(userId);
-        }
-
-        await ctx.answerCbQuery();
-      } catch (error) {
-        console.error('Error handling answer:', error);
-        await ctx.reply('Sorry, there was an error. Please try /start again.');
-        await ctx.answerCbQuery();
+        clearUserQueue(userId);
       }
-    });
+
+      await ctx.answerCbQuery();
+    } catch (error) {
+      console.error('Error handling quiz answer:', error);
+      clearUserQueue(userId);
+      await ctx.reply(
+        'Sorry, there was an error. Please try /start to begin again.'
+      );
+      await ctx.answerCbQuery();
+    }
   });
 
   return bot;
 };
+
+// Cleanup stale queues periodically
+setInterval(() => {
+  for (const [userId, queue] of messageQueues.entries()) {
+    if (!queue) {
+      messageQueues.delete(userId);
+    }
+  }
+}, 5 * 60 * 1000);
 
 module.exports = {
   setupActionHandlers,
