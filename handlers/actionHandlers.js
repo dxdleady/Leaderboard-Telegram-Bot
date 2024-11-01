@@ -1,5 +1,9 @@
 const { escapeMarkdown } = require('../utils/helpers');
-const { getUserSession, userSessions } = require('../services/sessionManager');
+const {
+  userSessions,
+  getUserSession,
+  hasUserCompletedQuiz,
+} = require('../services/sessionManager');
 const { hasUserCompletedQuiz } = require('../services/database');
 const { quizzes } = require('../config/quizData');
 const { Markup } = require('telegraf');
