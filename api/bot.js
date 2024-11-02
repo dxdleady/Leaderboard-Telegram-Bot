@@ -48,47 +48,88 @@ try {
   process.exit(1);
 }
 
+// Basic commands
+bot.command('start', ctx => ctx.reply('Welcome to the bot!'));
+bot.command('help', ctx => ctx.reply('Help message'));
+bot.on('message', ctx => ctx.reply('Got your message'));
+
+let wsServer = null;
+
 const setupWebSocket = server => {
-  const wss = new WebSocketServer({
-    server,
-    path: '/ws',
-    clientTracking: true,
-  });
+  if (typeof WebSocket === 'undefined') {
+    const WebSocket = require('ws');
+    const wss = new WebSocket.Server({
+      server,
+      path: '/ws',
+      clientTracking: true,
+    });
 
-  wss.on('connection', async (ws, request) => {
-    try {
-      const url = new URL(request.url, `http://${request.headers.host}`);
-      const userId = parseInt(url.searchParams.get('userId'));
-
-      if (!userId) {
-        ws.close(1008, 'UserId is required');
-        return;
-      }
-
+    wss.on('connection', ws => {
       ws.isAlive = true;
-      ws.userId = userId;
-
-      // Initialize connection before adding to manager
-      ws.on('error', error => {
-        console.error(`WebSocket error for user ${userId}:`, error);
-        wsManager.removeConnection(userId);
-      });
-
-      ws.on('close', () => {
-        wsManager.removeConnection(userId);
-      });
-
       ws.on('pong', () => {
         ws.isAlive = true;
       });
+      ws.on('error', console.error);
+    });
 
-      wsManager.addConnection(userId, ws);
-      console.log(`WebSocket connected for user ${userId}`);
-    } catch (error) {
-      console.error('WebSocket connection error:', error);
-      ws.close(1011, 'Internal Server Error');
+    // Heartbeat
+    const interval = setInterval(() => {
+      wss.clients.forEach(ws => {
+        if (ws.isAlive === false) return ws.terminate();
+        ws.isAlive = false;
+        ws.ping();
+      });
+    }, 30000);
+
+    wss.on('close', () => clearInterval(interval));
+
+    return wss;
+  }
+  return null;
+};
+
+// Serverless function handler
+const handler = async (req, res) => {
+  try {
+    // Handle WebSocket upgrade
+    if (req.headers.upgrade?.toLowerCase() === 'websocket') {
+      if (!wsServer && res.socket?.server) {
+        wsServer = setupWebSocket(res.socket.server);
+      }
+      if (wsServer) {
+        wsServer.handleUpgrade(req, req.socket, Buffer.alloc(0), ws => {
+          wsServer.emit('connection', ws, req);
+        });
+        return;
+      }
     }
-  });
+
+    // Health check
+    if (req.method === 'GET') {
+      return res.status(200).json({
+        ok: true,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Handle webhook updates
+    if (req.method === 'POST') {
+      try {
+        const buf = await rawBody(req);
+        const update = JSON.parse(buf.toString());
+        await bot.handleUpdate(update);
+        return res.status(200).json({ ok: true });
+      } catch (error) {
+        console.error('Webhook processing error:', error);
+        return res.status(200).json({ ok: true });
+      }
+    }
+
+    return res.status(405).json({ error: 'Method not allowed' });
+  } catch (error) {
+    console.error('Handler error:', error);
+    return res.status(200).json({ ok: true });
+  }
 
   // Heartbeat interval
   const heartbeat = setInterval(() => {
@@ -107,49 +148,6 @@ const setupWebSocket = server => {
   });
 
   return wss;
-};
-
-// Simple handler that doesn't initialize the bot immediately
-const handler = async (req, res) => {
-  try {
-    // Health check
-    if (req.method === 'GET') {
-      return res.status(200).json({
-        ok: true,
-        status: 'alive',
-        timestamp: new Date().toISOString(),
-      });
-    }
-
-    // Initialize bot only when needed
-    const bot = new Telegraf(process.env.BOT_TOKEN);
-
-    // Handle webhook updates
-    if (req.method === 'POST') {
-      try {
-        const buf = await rawBody(req);
-        const update = JSON.parse(buf.toString());
-
-        // Basic command handling
-        bot.command('start', ctx => ctx.reply('Welcome!'));
-        bot.command('help', ctx => ctx.reply('Help message'));
-        bot.on('message', ctx => ctx.reply('Got your message'));
-
-        // Process update
-        await bot.handleUpdate(update);
-
-        return res.status(200).json({ ok: true });
-      } catch (error) {
-        console.error('Processing error:', error);
-        return res.status(200).json({ ok: true });
-      }
-    }
-
-    return res.status(405).json({ error: 'Method not allowed' });
-  } catch (error) {
-    console.error('Handler error:', error);
-    return res.status(200).json({ ok: true });
-  }
 };
 
 // Configure serverless function
@@ -331,6 +329,15 @@ const testBotConnection = async () => {
     return false;
   }
 };
+
+// Setup webhook if in production
+if (process.env.VERCEL_URL && process.env.NODE_ENV === 'production') {
+  const webhookUrl = `https://${process.env.VERCEL_URL}/api/bot`;
+  bot.telegram
+    .setWebhook(webhookUrl)
+    .then(() => console.log('Webhook set:', webhookUrl))
+    .catch(console.error);
+}
 
 module.exports = {
   handler,
