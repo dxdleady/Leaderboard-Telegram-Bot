@@ -93,8 +93,6 @@ const initializeDatabase = async () => {
     await db.createCollection('userQuiz');
     await db.createCollection('sessions');
 
-    // Initialize any default data if needed
-
     console.log('Database initialized successfully');
   } catch (error) {
     console.error('Error initializing database:', error);
@@ -148,13 +146,64 @@ const resetUserProgress = async userId => {
   }
 };
 
+const updateQuizScore = async (userId, quizId, score, username) => {
+  try {
+    if (!isConnected) {
+      await connectToDatabase();
+    }
+
+    const userQuizCollection = mongoose.connection.collection('userQuiz');
+    await userQuizCollection.updateOne(
+      { userId: parseInt(userId), quizId: parseInt(quizId) },
+      {
+        $set: {
+          score,
+          username,
+          lastUpdated: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+    return true;
+  } catch (error) {
+    console.error('Error updating quiz score:', error);
+    return false;
+  }
+};
+
+const getLeaderboard = async (limit = 10) => {
+  try {
+    if (!isConnected) {
+      await connectToDatabase();
+    }
+
+    const userQuizCollection = mongoose.connection.collection('userQuiz');
+    return await userQuizCollection
+      .aggregate([
+        {
+          $group: {
+            _id: '$userId',
+            totalScore: { $sum: '$score' },
+            username: { $first: '$username' },
+            completedQuizzes: { $sum: { $cond: ['$completed', 1, 0] } },
+          },
+        },
+        { $sort: { totalScore: -1 } },
+        { $limit: limit },
+      ])
+      .toArray();
+  } catch (error) {
+    console.error('Error getting leaderboard:', error);
+    return [];
+  }
+};
+
 module.exports = {
   connectToDatabase,
   clearDatabase,
   initializeDatabase,
   hasUserCompletedQuiz,
-  getUserQuizScore,
-  updateUserQuizScore,
-  markQuizAsCompleted,
+  resetUserProgress,
+  updateQuizScore,
   getLeaderboard,
 };
