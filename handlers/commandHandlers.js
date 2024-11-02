@@ -141,10 +141,17 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
     }
   });
 
-  // Leaderboard Command
+  // Inside commandHandlers.js
   bot.command('leaderboard', async ctx => {
     try {
+      console.log('[DEBUG] Fetching leaderboard...');
+
       const userQuizCollection = mongoose.connection.collection('userQuiz');
+
+      // Add logging to check database connection
+      console.log('[DEBUG] Database state:', mongoose.connection.readyState);
+
+      // Fetch leaderboard with error handling
       const leaderboard = await userQuizCollection
         .aggregate([
           {
@@ -152,34 +159,60 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
               _id: '$userId',
               totalScore: { $sum: '$score' },
               username: { $first: '$username' },
+              completedQuizzes: { $addToSet: '$quizId' },
             },
           },
-          { $sort: { totalScore: -1 } },
+          {
+            $project: {
+              _id: 1,
+              totalScore: 1,
+              username: 1,
+              quizCount: { $size: '$completedQuizzes' },
+            },
+          },
+          { $sort: { totalScore: -1, quizCount: -1 } },
           { $limit: 10 },
         ])
         .toArray();
 
-      let leaderboardText = '🏆 *Top 10 Players*\n\n';
+      console.log('[DEBUG] Leaderboard data:', leaderboard);
+
+      if (!leaderboard || leaderboard.length === 0) {
+        await ctx.reply(
+          'No quiz results yet! Be the first to complete a quiz! 🎯',
+          {
+            parse_mode: 'Markdown',
+            protect_content: true,
+          }
+        );
+        return;
+      }
+
+      // Format leaderboard message
+      let leaderboardText = '🏆 *Top Quiz Champions*\n\n';
+
       leaderboard.forEach((user, index) => {
-        leaderboardText += `${index + 1}. ${user.username || 'Anonymous'} - ${
-          user.totalScore
-        } points\n`;
+        const medal =
+          index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : '🎯';
+        const username = user.username || 'Anonymous Player';
+        leaderboardText += `${medal} *${index + 1}.* ${username}\n`;
+        leaderboardText += `   Score: ${user.totalScore} points `;
+        leaderboardText += `(${user.quizCount} quizzes)\n\n`;
       });
 
+      leaderboardText += '\n_Complete more quizzes to climb the ranks!_ 🚀';
+
+      // Send formatted leaderboard
       await ctx.reply(leaderboardText, {
         parse_mode: 'Markdown',
         protect_content: true,
       });
-
-      if (wsManager.isConnected(ctx.from.id)) {
-        wsManager.sendToUser(ctx.from.id, {
-          type: 'leaderboard_update',
-          leaderboard: leaderboard,
-        });
-      }
     } catch (error) {
-      console.error('Error in leaderboard command:', error);
-      await ctx.reply('An error occurred while fetching the leaderboard.');
+      console.error('[DEBUG] Leaderboard error:', error);
+      await ctx.reply(
+        'Sorry, there was an error fetching the leaderboard. Please try again later.',
+        { protect_content: true }
+      );
     }
   });
 

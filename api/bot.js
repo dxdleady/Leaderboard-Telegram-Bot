@@ -101,7 +101,7 @@ const handler = async (request, response) => {
   try {
     console.log('[DEBUG] Received request:', request.method);
 
-    // Health check endpoint
+    // Health check endpoint - should only return status, not initialize anything
     if (request.method === 'GET') {
       const health = {
         ok: true,
@@ -112,7 +112,6 @@ const handler = async (request, response) => {
         environment: process.env.NODE_ENV,
         vercelUrl: process.env.VERCEL_URL,
       };
-      console.log('[DEBUG] Health check:', health);
       return response.status(200).json(health);
     }
 
@@ -120,6 +119,7 @@ const handler = async (request, response) => {
     if (request.method === 'POST') {
       console.log('[DEBUG] Received webhook POST');
 
+      // Only initialize on actual webhook calls from Telegram
       if (!bot) {
         console.log('[DEBUG] Bot not initialized, initializing services...');
         await initializeServices();
@@ -147,6 +147,36 @@ handler.config = {
   },
 };
 
+const startLocalBot = async () => {
+  try {
+    console.log('[DEBUG] Starting bot in local development mode...');
+
+    // Initialize services with local development flag
+    await initializeServices(true);
+
+    // Start bot in polling mode
+    await bot.launch({
+      dropPendingUpdates: true,
+    });
+
+    console.log('[DEBUG] Bot successfully started in polling mode');
+
+    // Enable graceful stop
+    process.once('SIGINT', () => {
+      console.log('[DEBUG] Received SIGINT signal');
+      bot?.stop('SIGINT');
+    });
+
+    process.once('SIGTERM', () => {
+      console.log('[DEBUG] Received SIGTERM signal');
+      bot?.stop('SIGTERM');
+    });
+  } catch (error) {
+    console.error('[DEBUG] Failed to start bot in local mode:', error);
+    process.exit(1);
+  }
+};
+
 // Setup webhook in production
 if (process.env.VERCEL_URL && process.env.NODE_ENV === 'production') {
   console.log('[DEBUG] Production environment detected, initializing...');
@@ -162,26 +192,22 @@ if (process.env.VERCEL_URL && process.env.NODE_ENV === 'production') {
       console.error('[DEBUG] Startup error:', error);
     });
 }
-
-// Local development startup
+// Handle different execution environments
 if (require.main === module) {
-  console.log('[DEBUG] Local development mode detected');
-  initializeServices()
-    .then(async () => {
-      console.log('[DEBUG] Services initialized, starting bot polling...');
-      await bot.launch({
-        dropPendingUpdates: true,
-      });
-      console.log('[DEBUG] Bot started in polling mode');
-    })
-    .catch(error => {
-      console.error('[DEBUG] Startup error:', error);
-      process.exit(1);
-    });
-
-  // Enable graceful stop
-  process.once('SIGINT', () => bot?.stop('SIGINT'));
-  process.once('SIGTERM', () => bot?.stop('SIGTERM'));
+  // Running directly (local development)
+  console.log('[DEBUG] Starting in local development mode');
+  startLocalBot().catch(error => {
+    console.error('[DEBUG] Local startup error:', error);
+    process.exit(1);
+  });
+} else {
+  // Running in production (Vercel)
+  if (process.env.VERCEL_URL && process.env.NODE_ENV === 'production') {
+    console.log('[DEBUG] Production environment detected, initializing...');
+    initializeServices()
+      .then(() => setupWebhook(process.env.VERCEL_URL))
+      .then(() => console.log('[DEBUG] Production setup complete'))
+      .catch(error => console.error('[DEBUG] Production setup error:', error));
+  }
 }
-
 module.exports = handler;
