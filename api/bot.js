@@ -109,64 +109,45 @@ const setupWebSocket = server => {
   return wss;
 };
 
-// Serverless function handler
+// Simple handler that doesn't initialize the bot immediately
 const handler = async (req, res) => {
-  // Log request details for debugging
-  console.log('Request received:', {
-    method: req.method,
-    url: req.url,
-    headers: req.headers,
-  });
-
   try {
-    // Health check endpoint
+    // Health check
     if (req.method === 'GET') {
-      // Get webhook info for health check
-      try {
-        const webhookInfo = await bot.telegram.getWebhookInfo();
-        return res.status(200).json({
-          ok: true,
-          timestamp: new Date().toISOString(),
-          webhook: webhookInfo,
-        });
-      } catch (error) {
-        console.error('Error getting webhook info:', error);
-        return res.status(200).json({
-          ok: true,
-          error: error.message,
-        });
-      }
+      return res.status(200).json({
+        ok: true,
+        status: 'alive',
+        timestamp: new Date().toISOString(),
+      });
     }
+
+    // Initialize bot only when needed
+    const bot = new Telegraf(process.env.BOT_TOKEN);
 
     // Handle webhook updates
     if (req.method === 'POST') {
-      console.log('Received POST request');
-
-      // Get the raw body
-      const buf = await rawBody(req);
-      console.log('Raw body received:', buf.toString());
-
-      // Parse update
-      const update = JSON.parse(buf.toString());
-      console.log('Update parsed:', update);
-
-      // Process update
       try {
-        await bot.handleUpdate(update);
-        console.log('Update processed successfully');
-      } catch (error) {
-        console.error('Error processing update:', error);
-      }
+        const buf = await rawBody(req);
+        const update = JSON.parse(buf.toString());
 
-      // Always return success to Telegram
-      return res.status(200).json({ ok: true });
+        // Basic command handling
+        bot.command('start', ctx => ctx.reply('Welcome!'));
+        bot.command('help', ctx => ctx.reply('Help message'));
+        bot.on('message', ctx => ctx.reply('Got your message'));
+
+        // Process update
+        await bot.handleUpdate(update);
+
+        return res.status(200).json({ ok: true });
+      } catch (error) {
+        console.error('Processing error:', error);
+        return res.status(200).json({ ok: true });
+      }
     }
 
-    // Handle unsupported methods
     return res.status(405).json({ error: 'Method not allowed' });
   } catch (error) {
     console.error('Handler error:', error);
-    // Always return 200 to Telegram even on error
     return res.status(200).json({ ok: true });
   }
 };
@@ -354,12 +335,4 @@ const testBotConnection = async () => {
 module.exports = {
   handler,
   testBotConnection, // Export for testing
-};
-
-// Configure serverless function settings
-handler.config = {
-  api: {
-    bodyParser: false,
-    externalResolver: true,
-  },
 };
