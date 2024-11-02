@@ -21,12 +21,21 @@ const safeDeleteMessage = async (ctx, messageId) => {
 };
 
 const setupCommandHandlers = bot => {
-  // Start command
   bot.command('start', async ctx => {
     try {
       const userId = ctx.from.id;
-      const hasCompleted = await hasUserCompletedQuiz(userId);
+      console.log('[DEBUG] Processing /start command for user:', userId);
 
+      // Clear any existing messages for clean start
+      if (ctx.message) {
+        await safeDeleteMessage(
+          ctx.telegram,
+          ctx.chat.id,
+          ctx.message.message_id
+        );
+      }
+
+      const hasCompleted = await hasUserCompletedQuiz(userId);
       if (hasCompleted) {
         await ctx.reply('You have already participated in this quiz!', {
           protect_content: true,
@@ -35,20 +44,23 @@ const setupCommandHandlers = bot => {
       }
 
       const welcomeMessage = `
-Seekers, have you been following our news and Alpha recently?
-Let's test that with our first Trivia Quiz!
-
-You have until Monday, October 14th, to get a perfect score and be entered into the drawing pool to win 50 $SUI tokens!
-Good luck, Seekers, and don't forget to follow us on X and Telegram to stay updated on our upcoming events! #News2Earn
+  🎮 *Welcome to the Quiz Bot\\!*
+  
+  Seekers, have you been following our news and Alpha recently?
+  Let's test that with our first Trivia Quiz\\!
+  
+  You have until Monday, October 14th, to get a perfect score and be entered into the drawing pool to win 50 \\$SUI tokens\\!
+  Good luck, Seekers, and don't forget to follow us on X and Telegram to stay updated on our upcoming events\\! \\#News2Earn
       `.trim();
 
       // Send welcome message with photo
-      await ctx.replyWithPhoto(
+      const startMessage = await ctx.replyWithPhoto(
         {
           url: 'https://drive.google.com/uc?id=1d4bbmOQWryf1QXzRg5rfP7YKWSd0QuKn',
         },
         {
           caption: welcomeMessage,
+          parse_mode: 'MarkdownV2',
           protect_content: true,
           reply_markup: {
             inline_keyboard: [
@@ -67,12 +79,16 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
         wsManager.sendToUser(userId, {
           type: 'quiz_welcome',
           quizId: 1,
+          messageId: startMessage.message_id,
         });
       }
+
+      console.log('[DEBUG] Start command processed successfully');
     } catch (error) {
-      console.error('Error in start command:', error);
+      console.error('[DEBUG] Error in start command:', error);
       await ctx.reply(
-        'Sorry, there was an error starting the quiz. Please try again.'
+        'Sorry, there was an error starting the quiz. Please try again.',
+        { protect_content: true }
       );
     }
   });

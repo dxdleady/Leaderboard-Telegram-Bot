@@ -1,4 +1,3 @@
-// handlers/actionHandlers.js
 const { escapeMarkdown } = require('../utils/helpers');
 const { quizzes } = require('../config/quizData');
 const { Markup } = require('telegraf');
@@ -6,80 +5,106 @@ const mongoose = require('mongoose');
 const { hasUserCompletedQuiz } = require('../services/database');
 const wsManager = require('../services/websocketManager');
 
-const safeDeleteMessage = async (bot, chatId, messageId) => {
+// Enhanced message deletion with retry
+const safeDeleteMessage = async (bot, chatId, messageId, retries = 3) => {
   if (!messageId) return;
-  try {
-    await bot.telegram.deleteMessage(chatId, messageId);
-  } catch (error) {
-    if (!error.message.includes('message to delete not found')) {
-      console.error('[DEBUG] Error deleting message:', error);
+
+  for (let i = 0; i < retries; i++) {
+    try {
+      await bot.telegram.deleteMessage(chatId, messageId);
+      return;
+    } catch (error) {
+      if (error.message.includes('message to delete not found')) {
+        return;
+      }
+      if (i === retries - 1) {
+        console.error('[DEBUG] Error deleting message after retries:', error);
+      }
+      await new Promise(resolve => setTimeout(resolve, 500)); // Wait 500ms before retry
     }
   }
 };
 
-async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
-  try {
-    console.log('[DEBUG] Sending quiz question:', {
-      quizId,
-      questionIndex,
-      userId,
-    });
-    const quiz = quizzes[quizId];
-    const questionData = quiz.questions[questionIndex];
-
-    if (!quiz || !questionData) {
-      console.error('[DEBUG] Quiz or question not found:', {
+// Enhanced quiz question sender with error handling and retries
+async function sendQuizQuestion(
+  bot,
+  chatId,
+  quizId,
+  questionIndex,
+  userId,
+  retries = 3
+) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      console.log('[DEBUG] Sending quiz question:', {
         quizId,
         questionIndex,
+        userId,
+        attempt: i + 1,
       });
-      await bot.telegram.sendMessage(
-        chatId,
-        'Error: Quiz or question not found.'
+
+      const quiz = quizzes[quizId];
+      const questionData = quiz.questions[questionIndex];
+
+      if (!quiz || !questionData) {
+        throw new Error('Quiz or question not found');
+      }
+
+      const messageText = [
+        `📝 *Question ${questionIndex + 1} of ${quiz.questions.length}*`,
+        '',
+        escapeMarkdown(questionData.question),
+        '',
+        `🔗 [Read full article](${escapeMarkdown(questionData.link)})`,
+      ].join('\n');
+
+      const buttons = questionData.options.map((option, index) => {
+        return [
+          Markup.button.callback(
+            option,
+            `q${quizId}_${questionIndex}_${index}_${userId}`
+          ),
+        ];
+      });
+
+      const sentMessage = await bot.telegram.sendMessage(chatId, messageText, {
+        parse_mode: 'MarkdownV2',
+        ...Markup.inlineKeyboard(buttons),
+        protect_content: true,
+      });
+
+      console.log(
+        '[DEBUG] Question sent successfully:',
+        sentMessage.message_id
       );
-      return;
+      return sentMessage;
+    } catch (error) {
+      console.error(
+        `[DEBUG] Error sending quiz question (attempt ${i + 1}):`,
+        error
+      );
+      if (i === retries - 1) {
+        await bot.telegram.sendMessage(
+          chatId,
+          'Error sending quiz question. Please type /start to begin again.'
+        );
+        throw error;
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
-
-    const messageText = [
-      `📝 *Question ${questionIndex + 1} of ${quiz.questions.length}*`,
-      '',
-      escapeMarkdown(questionData.question),
-      '',
-      `🔗 [Read full article](${escapeMarkdown(questionData.link)})`,
-    ].join('\n');
-
-    const buttons = questionData.options.map((option, index) => {
-      return [
-        Markup.button.callback(
-          option,
-          `q${quizId}_${questionIndex}_${index}_${userId}`
-        ),
-      ];
-    });
-
-    await bot.telegram.sendMessage(chatId, messageText, {
-      parse_mode: 'MarkdownV2',
-      ...Markup.inlineKeyboard(buttons),
-      protect_content: true,
-    });
-
-    console.log('[DEBUG] Question sent successfully');
-  } catch (error) {
-    console.error('[DEBUG] Error sending quiz question:', error);
-    await bot.telegram.sendMessage(
-      chatId,
-      'Error sending quiz question. Please try /start to begin again.'
-    );
   }
 }
 
-// Integrate the action handler
+// Setup action handlers with improved flow control
 const setupActionHandlers = bot => {
-  // Quiz start action
+  // Quiz start action with retry mechanism
   bot.action(/^start_quiz_(\d+)$/, async ctx => {
     try {
       const quizId = ctx.match[1];
       const userId = ctx.from.id;
       const chatId = ctx.chat.id;
+
+      console.log('[DEBUG] Starting quiz:', { quizId, userId, chatId });
 
       if (await hasUserCompletedQuiz(userId)) {
         await ctx.answerCbQuery('You have already completed this quiz!');
@@ -88,56 +113,64 @@ const setupActionHandlers = bot => {
 
       const quiz = quizzes[quizId];
       if (!quiz) {
-        await ctx.reply('Sorry, this quiz is no longer available.', {
-          protect_content: true,
-        });
+        await ctx.reply('Sorry, this quiz is no longer available.');
         return;
       }
 
-      await ctx
-        .deleteMessage(ctx.callbackQuery.message.message_id)
-        .catch(console.error);
+      // Delete the start message
+      if (ctx.callbackQuery.message) {
+        await safeDeleteMessage(
+          bot,
+          chatId,
+          ctx.callbackQuery.message.message_id
+        );
+      }
+
+      // Send first question with guaranteed delivery
       await sendQuizQuestion(bot, chatId, quizId, 0, userId);
       await ctx.answerCbQuery();
     } catch (error) {
-      console.error('Error handling start quiz button:', error);
+      console.error('[DEBUG] Error in start_quiz action:', error);
       await ctx.answerCbQuery('Error starting quiz. Please try again.');
     }
   });
 
-  // Quiz answer action
+  // Enhanced answer handling with guaranteed message flow
   bot.action(/q(\d+)_(\d+)_(\d+)_(\d+)/, async ctx => {
+    const startTime = Date.now();
     try {
       const [_, quizId, questionIndex, answerIndex, userId] =
         ctx.match.map(Number);
       const chatId = ctx.chat.id;
+
+      console.log('[DEBUG] Processing answer:', {
+        quizId,
+        questionIndex,
+        answerIndex,
+        userId,
+      });
 
       if (userId !== ctx.from.id) {
         await ctx.answerCbQuery('This is not your quiz question!');
         return;
       }
 
-      console.log(
-        `[DEBUG] User ${userId} answered question ${questionIndex} in quiz ${quizId}`
-      );
-      await ctx
-        .deleteMessage(ctx.callbackQuery.message.message_id)
-        .catch(console.error);
+      // Delete the question message
+      if (ctx.callbackQuery.message) {
+        await safeDeleteMessage(
+          bot,
+          chatId,
+          ctx.callbackQuery.message.message_id
+        );
+      }
 
       const quiz = quizzes[quizId];
       const questionData = quiz.questions[questionIndex];
       const userAnswer = questionData.options[answerIndex];
-      const userQuizCollection = mongoose.connection.collection('userQuiz');
-
       const isCorrect = userAnswer === questionData.correct;
 
-      const resultMsg = await ctx.reply(
-        isCorrect
-          ? `✅ Correct answer! 🎉\n\n🔗 Read full article: ${questionData.link}`
-          : `❌ Wrong answer!\nThe correct answer was: ${questionData.correct}\n\n🔗 Read full article: ${questionData.link}`,
-        { protect_content: true }
-      );
-
+      // Update database
+      const userQuizCollection = mongoose.connection.collection('userQuiz');
       if (isCorrect) {
         await userQuizCollection.updateOne(
           { userId, quizId },
@@ -149,11 +182,15 @@ const setupActionHandlers = bot => {
         );
       }
 
-      setTimeout(
-        () => safeDeleteMessage(bot, chatId, resultMsg.message_id),
-        2000
+      // Send result message with auto-deletion
+      const resultMsg = await ctx.reply(
+        isCorrect
+          ? `✅ Correct answer! 🎉\n\n🔗 Read full article: ${questionData.link}`
+          : `❌ Wrong answer!\nThe correct answer was: ${questionData.correct}\n\n🔗 Read full article: ${questionData.link}`,
+        { protect_content: true }
       );
 
+      // Notify websocket clients if connected
       if (wsManager.isConnected(userId)) {
         wsManager.sendToUser(userId, {
           type: 'answer_result',
@@ -164,12 +201,12 @@ const setupActionHandlers = bot => {
         });
       }
 
+      // Schedule result message deletion and next question
       setTimeout(async () => {
+        await safeDeleteMessage(bot, chatId, resultMsg.message_id);
+
         const nextQuestionIndex = questionIndex + 1;
         if (nextQuestionIndex < quiz.questions.length) {
-          console.log(
-            `[DEBUG] Sending next question ${nextQuestionIndex} for quiz ${quizId}`
-          );
           await sendQuizQuestion(
             bot,
             chatId,
@@ -178,7 +215,7 @@ const setupActionHandlers = bot => {
             userId
           );
         } else {
-          console.log(`[DEBUG] Completing quiz ${quizId} for user ${userId}`);
+          // Quiz completion handling
           const userQuiz = await userQuizCollection.findOne({ userId, quizId });
           const totalQuestions = quiz.questions.length;
           const userScore = userQuiz?.score || 0;
@@ -190,12 +227,13 @@ const setupActionHandlers = bot => {
             '🎉 *Quiz Completed\\!*',
             '',
             '📊 *Your Results:*',
-            `✓ Score: ${userScore}/${totalQuestions} \$begin:math:text$${scorePercentage}%\\$end:math:text$`,
+            `✓ Score: ${userScore}/${totalQuestions} \\(${scorePercentage}%\\)`,
             scorePercentage === 100
               ? "🏆 Perfect Score\\! You're eligible for the prize draw\\!"
               : 'Keep trying to get a perfect score\\!',
             '',
             '📋 *Available Commands:*',
+            '/start \\- Start a new quiz',
             '/help \\- Show all available commands',
             '/listquizzes \\- Show available quizzes',
             '/leaderboard \\- View top 10 players',
@@ -205,6 +243,7 @@ const setupActionHandlers = bot => {
             parse_mode: 'MarkdownV2',
             protect_content: true,
           });
+
           await userQuizCollection.updateOne(
             { userId, quizId },
             { $set: { completed: true } },
@@ -221,13 +260,18 @@ const setupActionHandlers = bot => {
             });
           }
         }
-      }, 2500);
+      }, 2000);
 
       await ctx.answerCbQuery();
+      console.log(
+        '[DEBUG] Answer processed successfully, time taken:',
+        Date.now() - startTime,
+        'ms'
+      );
     } catch (error) {
-      console.error('Error handling answer:', error);
+      console.error('[DEBUG] Error processing answer:', error);
       await ctx.reply(
-        'Sorry, there was an error. Please try /start to begin again.'
+        'Sorry, there was an error. Please type /start to begin again.'
       );
       await ctx.answerCbQuery();
     }
