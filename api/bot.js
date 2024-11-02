@@ -88,48 +88,47 @@ const setupWebSocket = server => {
   return null;
 };
 
-// Serverless function handler
-const handler = async (req, res) => {
+// Create the handler function
+const handler = async (request, response) => {
   try {
-    // Handle WebSocket upgrade
-    if (req.headers.upgrade?.toLowerCase() === 'websocket') {
-      if (!wsServer && res.socket?.server) {
-        wsServer = setupWebSocket(res.socket.server);
-      }
-      if (wsServer) {
-        wsServer.handleUpgrade(req, req.socket, Buffer.alloc(0), ws => {
-          wsServer.emit('connection', ws, req);
-        });
-        return;
-      }
-    }
-
     // Health check
-    if (req.method === 'GET') {
-      return res.status(200).json({
+    if (request.method === 'GET') {
+      return response.status(200).json({
         ok: true,
-        timestamp: new Date().toISOString(),
+        timestamp: new Date().toISOString()
       });
     }
 
     // Handle webhook updates
-    if (req.method === 'POST') {
+    if (request.method === 'POST') {
+      // Initialize bot
+      const bot = new Telegraf(process.env.BOT_TOKEN);
+      
+      // Set basic commands
+      bot.command('start', ctx => ctx.reply('Welcome!'));
+      bot.command('help', ctx => ctx.reply('Help message'));
+      bot.on('message', ctx => ctx.reply('Got your message'));
+
       try {
-        const buf = await rawBody(req);
+        const buf = await rawBody(request);
         const update = JSON.parse(buf.toString());
+        console.log('Received update:', update);
+        
         await bot.handleUpdate(update);
-        return res.status(200).json({ ok: true });
+        return response.status(200).json({ ok: true });
       } catch (error) {
-        console.error('Webhook processing error:', error);
-        return res.status(200).json({ ok: true });
+        console.error('Webhook error:', error);
+        return response.status(200).json({ ok: true });
       }
     }
 
-    return res.status(405).json({ error: 'Method not allowed' });
+    // Method not allowed
+    return response.status(405).json({ error: 'Method not allowed' });
   } catch (error) {
     console.error('Handler error:', error);
-    return res.status(200).json({ ok: true });
+    return response.status(200).json({ ok: true });
   }
+};
 
   // Heartbeat interval
   const heartbeat = setInterval(() => {
