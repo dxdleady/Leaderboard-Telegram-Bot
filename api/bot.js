@@ -1,8 +1,6 @@
 // api/bot.js
 const { Telegraf } = require('telegraf');
-const { createServer } = require('http');
 const { WebSocketServer } = require('ws');
-const mongoose = require('mongoose');
 const rawBody = require('raw-body');
 const wsManager = require('../services/websocketManager');
 const config = require('../config/default');
@@ -11,20 +9,31 @@ const {
   initializeDatabase,
   clearDatabase,
   resetUserProgress,
+  closeDatabase,
 } = require('../services/database');
 const setupCommandHandlers = require('../handlers/commandHandlers');
 const { setupActionHandlers } = require('../handlers/actionHandlers');
 
-// Initialize bot instance
-const bot = new Telegraf(process.env.BOT_TOKEN);
+const initBot = () => {
+  if (!process.env.BOT_TOKEN) {
+    throw new Error('BOT_TOKEN environment variable is not set');
+  }
 
-// Setup command and action handlers
+  const bot = new Telegraf(process.env.BOT_TOKEN);
+  bot.catch((err, ctx) => {
+    console.error('Bot error:', err);
+    ctx
+      .reply('An error occurred. Please try again later.')
+      .catch(console.error);
+  });
+
+  return bot;
+};
+
+const bot = initBot();
 setupCommandHandlers(bot);
 setupActionHandlers(bot);
 
-let wss;
-
-// WebSocket setup helper
 const setupWebSocket = server => {
   const wss = new WebSocketServer({
     server,
@@ -32,13 +41,10 @@ const setupWebSocket = server => {
     clientTracking: true,
   });
 
-  wss.on('connection', (ws, request) => {
+  wss.on('connection', async (ws, request) => {
     try {
-      const userId = parseInt(
-        new URL(request.url, `http://${request.headers.host}`).searchParams.get(
-          'userId'
-        )
-      );
+      const url = new URL(request.url, `http://${request.headers.host}`);
+      const userId = parseInt(url.searchParams.get('userId'));
 
       if (!userId) {
         ws.close(1008, 'UserId is required');
@@ -48,7 +54,8 @@ const setupWebSocket = server => {
       ws.isAlive = true;
       ws.userId = userId;
 
-      // Handle existing connections
+      await connectToDatabase();
+
       if (wsManager.isConnected(userId)) {
         wsManager.removeConnection(userId);
       }
@@ -58,9 +65,11 @@ const setupWebSocket = server => {
       ws.on('pong', () => {
         ws.isAlive = true;
       });
+
       ws.on('close', () => {
         wsManager.removeConnection(userId);
       });
+
       ws.on('error', error => {
         console.error(`WebSocket error for user ${userId}:`, error);
         wsManager.removeConnection(userId);
@@ -71,7 +80,6 @@ const setupWebSocket = server => {
     }
   });
 
-  // Heartbeat check
   const heartbeat = setInterval(() => {
     wss.clients.forEach(ws => {
       if (ws.isAlive === false) {
@@ -88,117 +96,8 @@ const setupWebSocket = server => {
   return wss;
 };
 
-// Parse raw body helper
-async function parseRawBody(req) {
-  const rawReqBody = await rawBody(req);
-  return JSON.parse(rawReqBody.toString());
-}
-
-// Admin commands setup
-const setupAdminCommands = () => {
-  // Reset command
-  bot.command('reset', async ctx => {
-    try {
-      if (
-        process.env.NODE_ENV === 'development' ||
-        config.bot.adminIds.includes(ctx.from.id)
-      ) {
-        await resetUserProgress(ctx.from.id);
-        await ctx.reply(
-          'Your quiz progress has been reset. You can start fresh now!'
-        );
-      } else {
-        await ctx.reply('This command is only available for administrators.');
-      }
-    } catch (error) {
-      console.error('Reset command error:', error);
-      await ctx.reply('Error resetting progress. Please try again later.');
-    }
-  });
-
-  // Debug command for development
-  if (process.env.NODE_ENV === 'development') {
-    bot.command('debug', async ctx => {
-      try {
-        const debugInfo = {
-          wsConnections: wsManager.getActiveConnections().length,
-          dbStatus: mongoose.connection.readyState,
-          sessionCount: global.userSessions?.size || 0,
-        };
-        await ctx.reply(`Debug info:\n${JSON.stringify(debugInfo, null, 2)}`);
-      } catch (error) {
-        console.error('Debug command error:', error);
-      }
-    });
-  }
-};
-
-// Bot initialization
-const initializeBot = async () => {
-  try {
-    if (process.env.NODE_ENV === 'production') {
-      const domain = process.env.VERCEL_URL || process.env.DOMAIN;
-      if (!domain) {
-        throw new Error('VERCEL_URL or DOMAIN environment variable is not set');
-      }
-
-      const webhookUrl = `https://${domain}/api/bot`;
-
-      await bot.telegram.deleteWebhook();
-      await bot.telegram.setWebhook(webhookUrl);
-
-      const webhookInfo = await bot.telegram.getWebhookInfo();
-      console.log('Webhook configured:', webhookInfo);
-    } else {
-      await bot.launch();
-      console.log('Bot launched in polling mode');
-    }
-
-    setupAdminCommands();
-
-    bot.catch(error => {
-      console.error('Bot error:', error);
-    });
-
-    return bot;
-  } catch (error) {
-    console.error('Bot initialization error:', error);
-    throw error;
-  }
-};
-
-// Cleanup function
-const cleanup = async () => {
-  console.log('Starting cleanup...');
-
-  try {
-    if (bot) {
-      await bot.stop('SIGTERM');
-    }
-
-    if (wss) {
-      await new Promise(resolve => wss.close(resolve));
-    }
-
-    wsManager.getActiveConnections().forEach(userId => {
-      wsManager.removeConnection(userId);
-    });
-
-    if (mongoose.connection.readyState === 1) {
-      await mongoose.connection.close();
-    }
-
-    console.log('Cleanup completed');
-  } catch (error) {
-    console.error('Cleanup error:', error);
-    process.exit(1);
-  }
-};
-
-// Main request handler
 const handler = async (req, res) => {
   try {
-    // Handle WebSocket upgrades
     if (req.headers.upgrade?.toLowerCase() === 'websocket') {
       if (!res.socket.server.ws) {
         res.socket.server.ws = setupWebSocket(res.socket.server);
@@ -215,41 +114,95 @@ const handler = async (req, res) => {
       return;
     }
 
-    // Connect to database
     await connectToDatabase();
 
-    // Health check
     if (req.method === 'GET') {
-      return res.status(200).json({
-        status: 'healthy',
-        webhook: true,
-        timestamp: new Date().toISOString(),
-        connections: wsManager.getActiveConnections().length,
-      });
+      const health = await getHealthStatus();
+      return res.status(200).json(health);
     }
 
-    // Handle webhook updates
     if (req.method === 'POST') {
-      const update = await parseRawBody(req);
-      await bot.handleUpdate(update);
+      const rawReqBody = await rawBody(req);
+      const update = JSON.parse(rawReqBody.toString());
+
+      const timeoutMs = 8000;
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(
+          () => reject(new Error('Update processing timeout')),
+          timeoutMs
+        );
+      });
+
+      await Promise.race([bot.handleUpdate(update), timeoutPromise]);
+
       return res.status(200).json({ ok: true });
     }
 
     return res.status(405).json({ error: 'Method not allowed' });
   } catch (error) {
     console.error('Request handler error:', error);
-    return res.status(200).json({ ok: true }); // Always return 200 to Telegram
+    return res.status(200).json({ ok: true, error: error.message });
   }
 };
 
-// Initialize bot on startup
-initializeBot().catch(console.error);
+const getHealthStatus = async () => {
+  try {
+    const webhookInfo = await bot.telegram.getWebhookInfo();
+    return {
+      status: 'healthy',
+      webhook: webhookInfo,
+      timestamp: new Date().toISOString(),
+      connections: wsManager.getActiveConnections().length,
+      database:
+        mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    };
+  } catch (error) {
+    return {
+      status: 'unhealthy',
+      error: error.message,
+      timestamp: new Date().toISOString(),
+    };
+  }
+};
 
-// Setup cleanup handlers
-process.once('SIGINT', cleanup);
-process.once('SIGTERM', cleanup);
+const initialize = async () => {
+  try {
+    await connectToDatabase();
+    await initializeDatabase();
 
-// Export configuration and handler
+    if (process.env.NODE_ENV === 'production') {
+      const domain = process.env.VERCEL_URL || process.env.DOMAIN;
+      if (!domain) {
+        throw new Error('VERCEL_URL or DOMAIN environment variable is not set');
+      }
+
+      const webhookUrl = `https://${domain}/api/bot`;
+      console.log('Setting webhook URL:', webhookUrl);
+
+      await bot.telegram.deleteWebhook();
+      await bot.telegram.setWebhook(webhookUrl);
+
+      const webhookInfo = await bot.telegram.getWebhookInfo();
+      console.log('Webhook configured:', webhookInfo);
+      return webhookInfo;
+    } else {
+      console.log('Starting bot in polling mode...');
+      await bot.launch();
+      console.log('Bot launched in polling mode');
+    }
+  } catch (error) {
+    console.error('Initialization error:', error);
+    throw error;
+  }
+};
+
+if (require.main === module) {
+  initialize().catch(error => {
+    console.error('Failed to initialize bot:', error);
+    process.exit(1);
+  });
+}
+
 handler.config = {
   api: {
     bodyParser: false,
@@ -258,9 +211,169 @@ handler.config = {
 };
 
 module.exports = handler;
-module.exports.config = {
-  api: {
-    bodyParser: false,
-    externalResolver: true,
-  },
+
+// services/websocketManager.js
+class WebSocketManager {
+  constructor() {
+    this.connections = new Map();
+    this.messageQueues = new Map();
+    this.processingQueues = new Map();
+    this.reconnectTimeouts = new Map();
+  }
+
+  addConnection(userId, ws) {
+    if (this.reconnectTimeouts.has(userId)) {
+      clearTimeout(this.reconnectTimeouts.get(userId));
+      this.reconnectTimeouts.delete(userId);
+    }
+
+    this.removeConnection(userId);
+    this.connections.set(userId, ws);
+    this.initializeQueue(userId);
+
+    ws.on('error', error => {
+      console.error(`WebSocket error for user ${userId}:`, error);
+      this.handleConnectionError(userId);
+    });
+
+    ws.on('close', () => {
+      this.handleConnectionError(userId);
+    });
+
+    this.processQueue(userId);
+  }
+
+  initializeQueue(userId) {
+    if (!this.messageQueues.has(userId)) {
+      this.messageQueues.set(userId, []);
+    }
+    this.processingQueues.set(userId, false);
+  }
+
+  removeConnection(userId) {
+    const ws = this.connections.get(userId);
+    if (ws) {
+      try {
+        ws.close();
+      } catch (error) {
+        console.error(`Error closing WebSocket for user ${userId}:`, error);
+      }
+    }
+    this.connections.delete(userId);
+    this.setReconnectTimeout(userId);
+  }
+
+  setReconnectTimeout(userId) {
+    if (this.reconnectTimeouts.has(userId)) {
+      clearTimeout(this.reconnectTimeouts.get(userId));
+    }
+
+    const timeout = setTimeout(() => {
+      this.messageQueues.delete(userId);
+      this.processingQueues.delete(userId);
+      this.reconnectTimeouts.delete(userId);
+    }, 5 * 60 * 1000);
+
+    this.reconnectTimeouts.set(userId, timeout);
+  }
+
+  handleConnectionError(userId) {
+    this.removeConnection(userId);
+    this.processingQueues.set(userId, false);
+  }
+
+  isConnected(userId) {
+    const ws = this.connections.get(userId);
+    return ws?.readyState === 1;
+  }
+
+  async queueMessage(userId, messageCallback) {
+    if (!this.messageQueues.has(userId)) {
+      this.initializeQueue(userId);
+    }
+
+    return new Promise((resolve, reject) => {
+      this.messageQueues.get(userId).push({
+        callback: messageCallback,
+        resolve,
+        reject,
+        timestamp: Date.now(),
+      });
+
+      if (!this.processingQueues.get(userId)) {
+        this.processQueue(userId);
+      }
+    });
+  }
+
+  async processQueue(userId) {
+    if (!this.messageQueues.has(userId) || this.processingQueues.get(userId)) {
+      return;
+    }
+
+    this.processingQueues.set(userId, true);
+    const queue = this.messageQueues.get(userId);
+
+    while (queue.length > 0 && this.isConnected(userId)) {
+      const message = queue[0];
+
+      try {
+        if (Date.now() - message.timestamp > 5 * 60 * 1000) {
+          queue.shift();
+          message.reject(new Error('Message timeout'));
+          continue;
+        }
+
+        await message.callback();
+        queue.shift();
+        message.resolve();
+      } catch (error) {
+        console.error(`Error processing message for user ${userId}:`, error);
+        queue.shift();
+        message.reject(error);
+      }
+    }
+
+    this.processingQueues.set(userId, false);
+  }
+
+  sendToUser(userId, data) {
+    const ws = this.connections.get(userId);
+    if (!ws || ws.readyState !== 1) {
+      return false;
+    }
+
+    try {
+      ws.send(JSON.stringify(data));
+      return true;
+    } catch (error) {
+      console.error(`Error sending message to user ${userId}:`, error);
+      this.handleConnectionError(userId);
+      return false;
+    }
+  }
+
+  updateQuizProgress(userId, progressData) {
+    return this.sendToUser(userId, {
+      type: 'quiz_progress',
+      ...progressData,
+    });
+  }
+
+  getActiveConnections() {
+    return Array.from(this.connections.keys());
+  }
+}
+
+module.exports = new WebSocketManager();
+
+let isConnected = false;
+
+module.exports = {
+  connectToDatabase,
+  clearDatabase,
+  initializeDatabase,
+  resetUserProgress,
+  closeDatabase,
+  isConnected: () => isConnected,
 };
