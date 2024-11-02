@@ -108,25 +108,31 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
     try {
       const userId = ctx.from.id;
       const userQuizCollection = mongoose.connection.collection('userQuiz');
+
+      // Retrieve completed quizzes for the user
       const completedQuizzes = await userQuizCollection
         .find({ userId, completed: true })
         .toArray();
-      const completedQuizIds = completedQuizzes.map(q => q.quizId);
+      const completedQuizIds = completedQuizzes.map(quiz => quiz.quizId);
 
+      // Initialize quiz list message
       let quizList = '📚 *Available Quizzes*\n\n';
 
-      Object.entries(quizzes).forEach(([quizId, quiz]) => {
+      // Iterate over quizzes and format list with completion status
+      for (const [quizId, quiz] of Object.entries(quizzes)) {
         const isCompleted = completedQuizIds.includes(parseInt(quizId));
         quizList += `${isCompleted ? '✅' : '🔸'} /quiz_${quizId} - ${
           quiz.title
         } ${isCompleted ? '(Completed)' : '(Available)'}\n`;
-      });
+      }
 
+      // Send the list of quizzes to the user
       await ctx.reply(quizList, {
         parse_mode: 'Markdown',
         protect_content: true,
       });
 
+      // If WebSocket is connected, send the quiz list update to the user
       if (wsManager.isConnected(userId)) {
         wsManager.sendToUser(userId, {
           type: 'quiz_list',
@@ -135,6 +141,8 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
       }
     } catch (error) {
       console.error('Error in listquizzes command:', error);
+
+      // Notify user of the error
       await ctx.reply(
         'An error occurred while listing quizzes. Please try again.'
       );
