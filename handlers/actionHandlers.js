@@ -16,31 +16,32 @@ const safeDeleteMessage = async (bot, chatId, messageId) => {
     await bot.telegram.deleteMessage(chatId, messageId);
   } catch (error) {
     if (!error.message.includes('message to delete not found')) {
-      console.error('Error deleting message:', error);
+      console.error('[DEBUG] Error deleting message:', error);
     }
   }
 };
 
 async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
   try {
-    const userSession = getUserSession(userId);
+    console.log('[DEBUG] Sending quiz question:', {
+      quizId,
+      questionIndex,
+      userId,
+    });
+
     const quiz = quizzes[quizId];
     const questionData = quiz.questions[questionIndex];
 
     if (!quiz || !questionData) {
+      console.error('[DEBUG] Quiz or question not found:', {
+        quizId,
+        questionIndex,
+      });
       await bot.telegram.sendMessage(
         chatId,
-        'Error: Quiz or question not found.',
-        {
-          protect_content: true,
-        }
+        'Error: Quiz or question not found.'
       );
       return;
-    }
-
-    // Delete previous message if exists
-    if (userSession.lastMessageId) {
-      await safeDeleteMessage(bot, chatId, userSession.lastMessageId);
     }
 
     const messageText = [
@@ -52,37 +53,130 @@ async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
     ].join('\n');
 
     const buttons = questionData.options.map((option, index) => {
-      const callbackData = `q${quizId}_${questionIndex}_${index}_${userId}`;
-      return [Markup.button.callback(option, callbackData)];
+      return [
+        Markup.button.callback(
+          option,
+          `q${quizId}_${questionIndex}_${index}_${userId}`
+        ),
+      ];
     });
 
-    const message = await bot.telegram.sendMessage(chatId, messageText, {
+    await bot.telegram.sendMessage(chatId, messageText, {
       parse_mode: 'MarkdownV2',
       ...Markup.inlineKeyboard(buttons),
       protect_content: true,
     });
 
-    userSession.lastMessageId = message.message_id;
-    userSession.currentQuizId = quizId;
-    userSession.currentQuestionIndex = questionIndex;
-
-    if (wsManager.isConnected(userId)) {
-      wsManager.updateQuizProgress(userId, {
-        questionIndex: questionIndex + 1,
-        totalQuestions: quiz.questions.length,
-        quizId,
-        quizTitle: quiz.title,
-      });
-    }
+    console.log('[DEBUG] Question sent successfully');
   } catch (error) {
-    console.error('Error sending quiz question:', error);
+    console.error('[DEBUG] Error sending quiz question:', error);
     await bot.telegram.sendMessage(
       chatId,
-      'Error sending quiz question. Please try /start to begin again.',
-      { protect_content: true }
+      'Error sending quiz question. Please try /start to begin again.'
     );
   }
 }
+
+const handleQuizAnswer = async (
+  ctx,
+  quizId,
+  questionIndex,
+  answerIndex,
+  userId
+) => {
+  try {
+    console.log('[DEBUG] Processing answer:', {
+      quizId,
+      questionIndex,
+      answerIndex,
+      userId,
+    });
+
+    const chatId = ctx.chat.id;
+    const quiz = quizzes[quizId];
+    const questionData = quiz.questions[questionIndex];
+    const userAnswer = questionData.options[answerIndex];
+    const isCorrect = userAnswer === questionData.correct;
+
+    // Delete the question message
+    await safeDeleteMessage(bot, chatId, ctx.callbackQuery.message.message_id);
+
+    // Show answer result
+    const resultMessage = await ctx.reply(
+      isCorrect
+        ? `✅ Correct answer! 🎉\n\n🔗 Read full article: ${questionData.link}`
+        : `❌ Wrong answer!\nThe correct answer was: ${questionData.correct}\n\n🔗 Read full article: ${questionData.link}`,
+      { protect_content: true }
+    );
+
+    // Update score in database if correct
+    if (isCorrect) {
+      const userQuizCollection = mongoose.connection.collection('userQuiz');
+      await userQuizCollection.updateOne(
+        { userId, quizId },
+        {
+          $inc: { score: 1 },
+          $set: { username: ctx.from.username || 'Anonymous' },
+        },
+        { upsert: true }
+      );
+    }
+
+    // Prepare for next question
+    const nextQuestionIndex = questionIndex + 1;
+
+    // Set timeout to delete result message and send next question
+    setTimeout(async () => {
+      await safeDeleteMessage(bot, chatId, resultMessage.message_id);
+
+      if (nextQuestionIndex < quiz.questions.length) {
+        // Send next question
+        await sendQuizQuestion(bot, chatId, quizId, nextQuestionIndex, userId);
+      } else {
+        // Quiz completed
+        const userQuizCollection = mongoose.connection.collection('userQuiz');
+        const userQuiz = await userQuizCollection.findOne({ userId, quizId });
+        const score = userQuiz?.score || 0;
+        const totalQuestions = quiz.questions.length;
+        const scorePercentage = Math.round((score / totalQuestions) * 100);
+
+        const completionText = [
+          '🎉 *Quiz Completed\\!*',
+          '',
+          '📊 *Your Results:*',
+          `✓ Score: ${score}/${totalQuestions} \\(${scorePercentage}%\\)`,
+          scorePercentage === 100
+            ? "🏆 Perfect Score\\! You're eligible for the prize draw\\!"
+            : 'Keep trying to get a perfect score\\!',
+          '',
+          '📋 *Available Commands:*',
+          '/help \\- Show all available commands',
+          '/listquizzes \\- Show available quizzes',
+          '/leaderboard \\- View top players',
+        ].join('\n');
+
+        await ctx.reply(completionText, {
+          parse_mode: 'MarkdownV2',
+          protect_content: true,
+        });
+
+        // Mark quiz as completed
+        await userQuizCollection.updateOne(
+          { userId, quizId },
+          { $set: { completed: true } },
+          { upsert: true }
+        );
+      }
+    }, 2000);
+
+    await ctx.answerCbQuery();
+  } catch (error) {
+    console.error('[DEBUG] Error handling answer:', error);
+    await ctx.reply(
+      'Sorry, there was an error. Please try /start to begin again.'
+    );
+  }
+};
 
 const setupActionHandlers = bot => {
   // Quiz start action

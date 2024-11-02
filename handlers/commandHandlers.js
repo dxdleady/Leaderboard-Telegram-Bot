@@ -141,47 +141,57 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
     }
   });
 
-  // Inside commandHandlers.js
+  // Leaderboard Command
   bot.command('leaderboard', async ctx => {
     try {
-      console.log('[DEBUG] Fetching leaderboard...');
+      console.log('[DEBUG] Fetching leaderboard data...');
+
+      // Ensure database connection
+      if (mongoose.connection.readyState !== 1) {
+        console.log('[DEBUG] Database not connected, attempting connection...');
+        await connectToDatabase();
+      }
 
       const userQuizCollection = mongoose.connection.collection('userQuiz');
 
-      // Add logging to check database connection
-      console.log('[DEBUG] Database state:', mongoose.connection.readyState);
-
-      // Fetch leaderboard with error handling
+      // More robust aggregation pipeline
       const leaderboard = await userQuizCollection
         .aggregate([
+          {
+            $match: { completed: true }, // Only include completed quizzes
+          },
           {
             $group: {
               _id: '$userId',
               totalScore: { $sum: '$score' },
-              username: { $first: '$username' },
-              completedQuizzes: { $addToSet: '$quizId' },
+              username: { $last: '$username' }, // Take the most recent username
+              quizCount: { $sum: 1 },
             },
           },
           {
-            $project: {
-              _id: 1,
-              totalScore: 1,
-              username: 1,
-              quizCount: { $size: '$completedQuizzes' },
+            $match: {
+              totalScore: { $gt: 0 }, // Only include users with points
             },
           },
-          { $sort: { totalScore: -1, quizCount: -1 } },
-          { $limit: 10 },
+          {
+            $sort: {
+              totalScore: -1,
+              quizCount: -1,
+            },
+          },
+          {
+            $limit: 10,
+          },
         ])
         .toArray();
 
-      console.log('[DEBUG] Leaderboard data:', leaderboard);
+      console.log('[DEBUG] Leaderboard raw data:', leaderboard);
 
       if (!leaderboard || leaderboard.length === 0) {
         await ctx.reply(
-          'No quiz results yet! Be the first to complete a quiz! 🎯',
+          '📊 *No quiz results yet\\!*\n\nBe the first to complete a quiz and make it to the leaderboard\\! Use /start to begin\\.',
           {
-            parse_mode: 'Markdown',
+            parse_mode: 'MarkdownV2',
             protect_content: true,
           }
         );
@@ -189,29 +199,36 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
       }
 
       // Format leaderboard message
-      let leaderboardText = '🏆 *Top Quiz Champions*\n\n';
+      let message = '🏆 *QUIZ LEADERBOARD* 🏆\n\n';
 
-      leaderboard.forEach((user, index) => {
+      leaderboard.forEach((entry, index) => {
         const medal =
           index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : '🎯';
-        const username = user.username || 'Anonymous Player';
-        leaderboardText += `${medal} *${index + 1}.* ${username}\n`;
-        leaderboardText += `   Score: ${user.totalScore} points `;
-        leaderboardText += `(${user.quizCount} quizzes)\n\n`;
+        const username = entry.username || 'Anonymous Player';
+        const position = `${index + 1}`.padStart(2, ' ');
+
+        message += `${medal} ${position}\\. *${escapeMarkdown(username)}*\n`;
+        message += `    ↳ Score: ${entry.totalScore} points \\(${
+          entry.quizCount
+        } ${entry.quizCount === 1 ? 'quiz' : 'quizzes'}\\)\n\n`;
       });
 
-      leaderboardText += '\n_Complete more quizzes to climb the ranks!_ 🚀';
+      message += '\n_Complete more quizzes to climb the ranks\\!_ 🚀';
 
-      // Send formatted leaderboard
-      await ctx.reply(leaderboardText, {
-        parse_mode: 'Markdown',
+      await ctx.reply(message, {
+        parse_mode: 'MarkdownV2',
         protect_content: true,
       });
+
+      console.log('[DEBUG] Leaderboard sent successfully');
     } catch (error) {
       console.error('[DEBUG] Leaderboard error:', error);
+
       await ctx.reply(
         'Sorry, there was an error fetching the leaderboard. Please try again later.',
-        { protect_content: true }
+        {
+          protect_content: true,
+        }
       );
     }
   });
