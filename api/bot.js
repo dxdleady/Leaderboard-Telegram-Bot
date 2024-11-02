@@ -95,7 +95,7 @@ const handler = async (request, response) => {
     if (request.method === 'GET') {
       return response.status(200).json({
         ok: true,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     }
 
@@ -103,7 +103,7 @@ const handler = async (request, response) => {
     if (request.method === 'POST') {
       // Initialize bot
       const bot = new Telegraf(process.env.BOT_TOKEN);
-      
+
       // Set basic commands
       bot.command('start', ctx => ctx.reply('Welcome!'));
       bot.command('help', ctx => ctx.reply('Help message'));
@@ -113,7 +113,7 @@ const handler = async (request, response) => {
         const buf = await rawBody(request);
         const update = JSON.parse(buf.toString());
         console.log('Received update:', update);
-        
+
         await bot.handleUpdate(update);
         return response.status(200).json({ ok: true });
       } catch (error) {
@@ -130,24 +130,23 @@ const handler = async (request, response) => {
   }
 };
 
-  // Heartbeat interval
-  const heartbeat = setInterval(() => {
-    wss.clients.forEach(ws => {
-      if (ws.isAlive === false) {
-        wsManager.removeConnection(ws.userId);
-        return ws.terminate();
-      }
-      ws.isAlive = false;
-      ws.ping();
-    });
-  }, 30000);
-
-  wss.on('close', () => {
-    clearInterval(heartbeat);
+// Heartbeat interval
+const heartbeat = setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (ws.isAlive === false) {
+      wsManager.removeConnection(ws.userId);
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
   });
+}, 30000);
 
-  return wss;
-};
+wss.on('close', () => {
+  clearInterval(heartbeat);
+});
+
+return wss;
 
 // Configure serverless function
 handler.config = {
