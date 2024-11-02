@@ -8,26 +8,30 @@ const mongoose = require('mongoose');
 const config = require('../config/default');
 const wsManager = require('../services/websocketManager');
 
+// Helper function for safe message deletion
+const safeDeleteMessage = async (ctx, messageId) => {
+  try {
+    if (messageId) {
+      await ctx.deleteMessage(messageId);
+    }
+  } catch (error) {
+    // Ignore deletion errors and continue
+    console.log(`Could not delete message ${messageId}:`, error.description);
+  }
+};
+
 const setupCommandHandlers = bot => {
-  // Start command handler
+  // Start command
   bot.command('start', async ctx => {
     try {
       const userId = ctx.from.id;
       const hasCompleted = await hasUserCompletedQuiz(userId);
 
       if (hasCompleted) {
-        await ctx.reply(
-          'You have already participated in this quiz. Good luck!',
-          {
-            protect_content: true,
-          }
-        );
+        await ctx.reply('You have already participated in this quiz!', {
+          protect_content: true,
+        });
         return;
-      }
-
-      // Delete the command message
-      if (ctx.message) {
-        await ctx.deleteMessage(ctx.message.message_id).catch(console.error);
       }
 
       const welcomeMessage = `
@@ -37,8 +41,6 @@ Let's test that with our first Trivia Quiz!
 You have until Monday, October 14th, to get a perfect score and be entered into the drawing pool to win 50 $SUI tokens!
 Good luck, Seekers, and don't forget to follow us on X and Telegram to stay updated on our upcoming events! #News2Earn
       `.trim();
-
-      const latestQuizId = getLatestQuizId();
 
       // Send welcome message with photo
       await ctx.replyWithPhoto(
@@ -53,7 +55,7 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
               [
                 {
                   text: '🎮 Start Quiz',
-                  callback_data: `start_quiz_${latestQuizId}`,
+                  callback_data: 'start_quiz_1',
                 },
               ],
             ],
@@ -64,7 +66,7 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
       if (wsManager.isConnected(userId)) {
         wsManager.sendToUser(userId, {
           type: 'quiz_welcome',
-          quizId: latestQuizId,
+          quizId: 1,
         });
       }
     } catch (error) {
@@ -78,11 +80,6 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
   // Help Command
   bot.command('help', async ctx => {
     try {
-      // Delete command message
-      if (ctx.message) {
-        await ctx.deleteMessage(ctx.message.message_id).catch(console.error);
-      }
-
       const helpMessage = `📋 Available Commands:
 
 /start - 🎮 Start the quiz game
@@ -101,10 +98,7 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
     } catch (error) {
       console.error('Error in help command:', error);
       await ctx.reply(
-        'An error occurred while showing help. Please try again.',
-        {
-          protect_content: true,
-        }
+        'An error occurred while showing help. Please try again.'
       );
     }
   });
@@ -112,11 +106,6 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
   // List Quizzes Command
   bot.command('listquizzes', async ctx => {
     try {
-      // Delete command message
-      if (ctx.message) {
-        await ctx.deleteMessage(ctx.message.message_id).catch(console.error);
-      }
-
       const userId = ctx.from.id;
       const userQuizCollection = mongoose.connection.collection('userQuiz');
       const completedQuizzes = await userQuizCollection
@@ -124,22 +113,17 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
         .toArray();
       const completedQuizIds = completedQuizzes.map(q => q.quizId);
 
-      let quizList = '📚 *Available Quizzes* 📚\n\n';
+      let quizList = '📚 *Available Quizzes*\n\n';
 
-      for (const quizId in quizzes) {
-        if (quizzes.hasOwnProperty(quizId)) {
-          const isCompleted = completedQuizIds.includes(parseInt(quizId));
-          const quizTitle = escapeMarkdown(quizzes[quizId].title);
-          quizList += `${
-            isCompleted ? '✅' : '🔸'
-          } /quiz\\_${quizId} \\- ${quizTitle} ${
-            isCompleted ? '\\(Completed\\)' : '\\(Available\\)'
-          }\n`;
-        }
-      }
+      Object.entries(quizzes).forEach(([quizId, quiz]) => {
+        const isCompleted = completedQuizIds.includes(parseInt(quizId));
+        quizList += `${isCompleted ? '✅' : '🔸'} /quiz_${quizId} - ${
+          quiz.title
+        } ${isCompleted ? '(Completed)' : '(Available)'}\n`;
+      });
 
       await ctx.reply(quizList, {
-        parse_mode: 'MarkdownV2',
+        parse_mode: 'Markdown',
         protect_content: true,
       });
 
@@ -150,12 +134,9 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
         });
       }
     } catch (error) {
-      console.error('Error in /listquizzes command:', error);
+      console.error('Error in listquizzes command:', error);
       await ctx.reply(
-        'An error occurred while listing quizzes. Please try again later.',
-        {
-          protect_content: true,
-        }
+        'An error occurred while listing quizzes. Please try again.'
       );
     }
   });
@@ -163,11 +144,6 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
   // Leaderboard Command
   bot.command('leaderboard', async ctx => {
     try {
-      // Delete command message
-      if (ctx.message) {
-        await ctx.deleteMessage(ctx.message.message_id).catch(console.error);
-      }
-
       const userQuizCollection = mongoose.connection.collection('userQuiz');
       const leaderboard = await userQuizCollection
         .aggregate([
@@ -183,9 +159,9 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
         ])
         .toArray();
 
-      let leaderboardText = '🏆 *Leaderboard* 🏆\n\n';
+      let leaderboardText = '🏆 *Top 10 Players*\n\n';
       leaderboard.forEach((user, index) => {
-        leaderboardText += `${index + 1}. ${user.username || 'Unknown'} - ${
+        leaderboardText += `${index + 1}. ${user.username || 'Anonymous'} - ${
           user.totalScore
         } points\n`;
       });
@@ -203,9 +179,7 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
       }
     } catch (error) {
       console.error('Error in leaderboard command:', error);
-      await ctx.reply('An error occurred while fetching the leaderboard.', {
-        protect_content: true,
-      });
+      await ctx.reply('An error occurred while fetching the leaderboard.');
     }
   });
 

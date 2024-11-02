@@ -2,37 +2,51 @@
 const { Telegraf } = require('telegraf');
 const { WebSocketServer } = require('ws');
 const rawBody = require('raw-body');
+const mongoose = require('mongoose');
 const wsManager = require('../services/websocketManager');
 const config = require('../config/default');
 const {
+  clearDatabase,
   connectToDatabase,
   initializeDatabase,
-  clearDatabase,
-  resetUserProgress,
-  closeDatabase,
 } = require('../services/database');
-const setupCommandHandlers = require('../handlers/commandHandlers');
+
+// Import handlers - make sure these paths match your project structure
+const { setupCommandHandlers } = require('../handlers/commandHandlers');
 const { setupActionHandlers } = require('../handlers/actionHandlers');
 
+// Initialize the bot
+let bot = null;
+
 const initBot = () => {
+  console.log('Initializing bot...');
+
   if (!process.env.BOT_TOKEN) {
     throw new Error('BOT_TOKEN environment variable is not set');
   }
 
-  const bot = new Telegraf(process.env.BOT_TOKEN);
-  bot.catch((err, ctx) => {
+  const newBot = new Telegraf(process.env.BOT_TOKEN);
+
+  newBot.catch(async (err, ctx) => {
     console.error('Bot error:', err);
-    ctx
-      .reply('An error occurred. Please try again later.')
-      .catch(console.error);
+    try {
+      await ctx.reply('An error occurred. Please try again later.');
+    } catch (replyError) {
+      console.error('Error sending error message:', replyError);
+    }
   });
 
-  return bot;
+  console.log('Bot instance created successfully');
+  return newBot;
 };
 
-const bot = initBot();
-setupCommandHandlers(bot);
-setupActionHandlers(bot);
+// Create bot instance
+try {
+  bot = initBot();
+} catch (error) {
+  console.error('Failed to initialize bot:', error);
+  process.exit(1);
+}
 
 const setupWebSocket = server => {
   const wss = new WebSocketServer({
@@ -54,32 +68,29 @@ const setupWebSocket = server => {
       ws.isAlive = true;
       ws.userId = userId;
 
-      await connectToDatabase();
-
-      if (wsManager.isConnected(userId)) {
+      // Initialize connection before adding to manager
+      ws.on('error', error => {
+        console.error(`WebSocket error for user ${userId}:`, error);
         wsManager.removeConnection(userId);
-      }
-
-      wsManager.addConnection(userId, ws);
-
-      ws.on('pong', () => {
-        ws.isAlive = true;
       });
 
       ws.on('close', () => {
         wsManager.removeConnection(userId);
       });
 
-      ws.on('error', error => {
-        console.error(`WebSocket error for user ${userId}:`, error);
-        wsManager.removeConnection(userId);
+      ws.on('pong', () => {
+        ws.isAlive = true;
       });
+
+      wsManager.addConnection(userId, ws);
+      console.log(`WebSocket connected for user ${userId}`);
     } catch (error) {
       console.error('WebSocket connection error:', error);
       ws.close(1011, 'Internal Server Error');
     }
   });
 
+  // Heartbeat interval
   const heartbeat = setInterval(() => {
     wss.clients.forEach(ws => {
       if (ws.isAlive === false) {
@@ -91,13 +102,16 @@ const setupWebSocket = server => {
     });
   }, 30000);
 
-  wss.on('close', () => clearInterval(heartbeat));
+  wss.on('close', () => {
+    clearInterval(heartbeat);
+  });
 
   return wss;
 };
 
 const handler = async (req, res) => {
   try {
+    // Handle WebSocket upgrade requests
     if (req.headers.upgrade?.toLowerCase() === 'websocket') {
       if (!res.socket.server.ws) {
         res.socket.server.ws = setupWebSocket(res.socket.server);
@@ -114,33 +128,45 @@ const handler = async (req, res) => {
       return;
     }
 
+    // Connect to database for HTTP requests
     await connectToDatabase();
 
+    // Handle health check
     if (req.method === 'GET') {
       const health = await getHealthStatus();
       return res.status(200).json(health);
     }
 
+    // Handle webhook updates
     if (req.method === 'POST') {
-      const rawReqBody = await rawBody(req);
-      const update = JSON.parse(rawReqBody.toString());
+      let update;
+      try {
+        const rawReqBody = await rawBody(req);
+        update = JSON.parse(rawReqBody.toString());
+      } catch (error) {
+        console.error('Error parsing webhook body:', error);
+        return res.status(200).json({ ok: true }); // Return 200 even for parsing errors
+      }
 
-      const timeoutMs = 8000;
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(
-          () => reject(new Error('Update processing timeout')),
-          timeoutMs
-        );
-      });
+      try {
+        await Promise.race([
+          bot.handleUpdate(update),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Update timeout')), 8000)
+          ),
+        ]);
 
-      await Promise.race([bot.handleUpdate(update), timeoutPromise]);
-
-      return res.status(200).json({ ok: true });
+        return res.status(200).json({ ok: true });
+      } catch (error) {
+        console.error('Error processing update:', error);
+        return res.status(200).json({ ok: true }); // Always return 200 for webhook
+      }
     }
 
     return res.status(405).json({ error: 'Method not allowed' });
   } catch (error) {
-    console.error('Request handler error:', error);
+    console.error('Handler error:', error);
+    // Always return 200 for webhook requests to prevent Telegram retries
     return res.status(200).json({ ok: true, error: error.message });
   }
 };
@@ -154,7 +180,7 @@ const getHealthStatus = async () => {
       timestamp: new Date().toISOString(),
       connections: wsManager.getActiveConnections().length,
       database:
-        mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+        mongoose.connection?.readyState === 1 ? 'connected' : 'disconnected',
     };
   } catch (error) {
     return {
@@ -165,10 +191,46 @@ const getHealthStatus = async () => {
   }
 };
 
+const setupHandlers = async bot => {
+  console.log('Setting up command handlers...');
+  const setupCommandHandlers = require('../handlers/commandHandlers');
+  await setupCommandHandlers(bot);
+  console.log('Command handlers setup complete');
+
+  console.log('Setting up action handlers...');
+  const { setupActionHandlers } = require('../handlers/actionHandlers');
+  await setupActionHandlers(bot);
+  console.log('Action handlers setup complete');
+};
+
 const initialize = async () => {
   try {
+    console.log('Starting initialization process...');
+
+    // Connect to database
+    console.log('Connecting to database...');
     await connectToDatabase();
+    console.log('Database connection established');
+
+    if (process.argv.includes('cleanup')) {
+      console.log('Cleaning database...');
+      await clearDatabase();
+    }
+
+    // Initialize database
+    console.log('Initializing database...');
     await initializeDatabase();
+
+    console.log('Database initialization complete');
+    // Initialize bot
+    console.log('Creating bot instance...');
+    bot = initBot();
+    console.log('Bot instance created');
+
+    // Setup handlers
+    console.log('Setting up handlers...');
+    await setupHandlers(bot);
+    console.log('Handlers setup complete');
 
     if (process.env.NODE_ENV === 'production') {
       const domain = process.env.VERCEL_URL || process.env.DOMAIN;
@@ -184,202 +246,81 @@ const initialize = async () => {
 
       const webhookInfo = await bot.telegram.getWebhookInfo();
       console.log('Webhook configured:', webhookInfo);
-      return webhookInfo;
     } else {
-      if (process.argv.includes('cleanup')) {
-        console.log('Cleaning database...');
-        await clearDatabase();
-        await initializeDatabase();
-        console.log('Database reinitialized with fresh data.');
-      }
-      console.log('Starting bot in polling mode...');
-      await bot.launch();
-      console.log('Bot launched in polling mode');
+      console.log('Development environment detected, starting polling mode');
+      await startPolling(bot);
     }
+
+    console.log('Initialization complete!');
   } catch (error) {
     console.error('Initialization error:', error);
     throw error;
   }
 };
 
+const startPolling = async bot => {
+  try {
+    console.log('Starting bot in polling mode...');
+    await bot.launch({
+      dropPendingUpdates: true,
+      polling: {
+        timeout: 30,
+        limit: 100,
+      },
+    });
+    console.log('Bot is running in polling mode');
+
+    // Setup shutdown handlers
+    process.once('SIGINT', () => {
+      console.log('SIGINT received, stopping bot...');
+      bot.stop('SIGINT');
+    });
+
+    process.once('SIGTERM', () => {
+      console.log('SIGTERM received, stopping bot...');
+      bot.stop('SIGTERM');
+    });
+
+    return true;
+  } catch (error) {
+    console.error('Error starting polling mode:', error);
+    throw error;
+  }
+};
+
+// Modified initialization for direct execution
 if (require.main === module) {
   initialize().catch(error => {
     console.error('Failed to initialize bot:', error);
+    if (error.stack) {
+      console.error('Error stack:', error.stack);
+    }
     process.exit(1);
   });
 }
 
+// Test connection function
+const testBotConnection = async () => {
+  try {
+    console.log('Testing bot connection...');
+    const me = await bot.telegram.getMe();
+    console.log('Bot connection successful:', me);
+    return true;
+  } catch (error) {
+    console.error('Bot connection test failed:', error);
+    return false;
+  }
+};
+
+module.exports = {
+  handler,
+  testBotConnection, // Export for testing
+};
+
+// Configure serverless function settings
 handler.config = {
   api: {
     bodyParser: false,
     externalResolver: true,
   },
-};
-
-module.exports = handler;
-
-// services/websocketManager.js
-class WebSocketManager {
-  constructor() {
-    this.connections = new Map();
-    this.messageQueues = new Map();
-    this.processingQueues = new Map();
-    this.reconnectTimeouts = new Map();
-  }
-
-  addConnection(userId, ws) {
-    if (this.reconnectTimeouts.has(userId)) {
-      clearTimeout(this.reconnectTimeouts.get(userId));
-      this.reconnectTimeouts.delete(userId);
-    }
-
-    this.removeConnection(userId);
-    this.connections.set(userId, ws);
-    this.initializeQueue(userId);
-
-    ws.on('error', error => {
-      console.error(`WebSocket error for user ${userId}:`, error);
-      this.handleConnectionError(userId);
-    });
-
-    ws.on('close', () => {
-      this.handleConnectionError(userId);
-    });
-
-    this.processQueue(userId);
-  }
-
-  initializeQueue(userId) {
-    if (!this.messageQueues.has(userId)) {
-      this.messageQueues.set(userId, []);
-    }
-    this.processingQueues.set(userId, false);
-  }
-
-  removeConnection(userId) {
-    const ws = this.connections.get(userId);
-    if (ws) {
-      try {
-        ws.close();
-      } catch (error) {
-        console.error(`Error closing WebSocket for user ${userId}:`, error);
-      }
-    }
-    this.connections.delete(userId);
-    this.setReconnectTimeout(userId);
-  }
-
-  setReconnectTimeout(userId) {
-    if (this.reconnectTimeouts.has(userId)) {
-      clearTimeout(this.reconnectTimeouts.get(userId));
-    }
-
-    const timeout = setTimeout(() => {
-      this.messageQueues.delete(userId);
-      this.processingQueues.delete(userId);
-      this.reconnectTimeouts.delete(userId);
-    }, 5 * 60 * 1000);
-
-    this.reconnectTimeouts.set(userId, timeout);
-  }
-
-  handleConnectionError(userId) {
-    this.removeConnection(userId);
-    this.processingQueues.set(userId, false);
-  }
-
-  isConnected(userId) {
-    const ws = this.connections.get(userId);
-    return ws?.readyState === 1;
-  }
-
-  async queueMessage(userId, messageCallback) {
-    if (!this.messageQueues.has(userId)) {
-      this.initializeQueue(userId);
-    }
-
-    return new Promise((resolve, reject) => {
-      this.messageQueues.get(userId).push({
-        callback: messageCallback,
-        resolve,
-        reject,
-        timestamp: Date.now(),
-      });
-
-      if (!this.processingQueues.get(userId)) {
-        this.processQueue(userId);
-      }
-    });
-  }
-
-  async processQueue(userId) {
-    if (!this.messageQueues.has(userId) || this.processingQueues.get(userId)) {
-      return;
-    }
-
-    this.processingQueues.set(userId, true);
-    const queue = this.messageQueues.get(userId);
-
-    while (queue.length > 0 && this.isConnected(userId)) {
-      const message = queue[0];
-
-      try {
-        if (Date.now() - message.timestamp > 5 * 60 * 1000) {
-          queue.shift();
-          message.reject(new Error('Message timeout'));
-          continue;
-        }
-
-        await message.callback();
-        queue.shift();
-        message.resolve();
-      } catch (error) {
-        console.error(`Error processing message for user ${userId}:`, error);
-        queue.shift();
-        message.reject(error);
-      }
-    }
-
-    this.processingQueues.set(userId, false);
-  }
-
-  sendToUser(userId, data) {
-    const ws = this.connections.get(userId);
-    if (!ws || ws.readyState !== 1) {
-      return false;
-    }
-
-    try {
-      ws.send(JSON.stringify(data));
-      return true;
-    } catch (error) {
-      console.error(`Error sending message to user ${userId}:`, error);
-      this.handleConnectionError(userId);
-      return false;
-    }
-  }
-
-  updateQuizProgress(userId, progressData) {
-    return this.sendToUser(userId, {
-      type: 'quiz_progress',
-      ...progressData,
-    });
-  }
-
-  getActiveConnections() {
-    return Array.from(this.connections.keys());
-  }
-}
-
-module.exports = new WebSocketManager();
-
-let isConnected = false;
-
-module.exports = {
-  connectToDatabase,
-  clearDatabase,
-  initializeDatabase,
-  resetUserProgress,
-  closeDatabase,
-  isConnected: () => isConnected,
 };

@@ -5,6 +5,7 @@ class WebSocketManager {
     this.messageQueues = new Map();
     this.processingQueues = new Map();
     this.reconnectTimeouts = new Map();
+    this.pendingPromises = new Map(); // Track pending promises
   }
 
   addConnection(userId, ws) {
@@ -14,74 +15,52 @@ class WebSocketManager {
       this.reconnectTimeouts.delete(userId);
     }
 
-    // Close existing connection if any
+    // Properly clean up existing connection
     this.removeConnection(userId);
 
-    // Set up the new connection
+    // Set up the new connection with error handling
     this.connections.set(userId, ws);
     this.initializeQueue(userId);
 
-    // Set up error handling
+    // Enhanced error handling
     ws.on('error', error => {
       console.error(`WebSocket error for user ${userId}:`, error);
       this.handleConnectionError(userId);
     });
 
     ws.on('close', () => {
+      console.log(`WebSocket closed for user ${userId}`);
       this.handleConnectionError(userId);
     });
 
+    // Add ping/pong handling
+    ws.isAlive = true;
+    ws.on('pong', () => {
+      ws.isAlive = true;
+    });
+
     // Process any pending messages
-    this.processQueue(userId);
+    setImmediate(() => this.processQueue(userId));
   }
 
-  initializeQueue(userId) {
-    if (!this.messageQueues.has(userId)) {
-      this.messageQueues.set(userId, []);
-    }
-    this.processingQueues.set(userId, false);
-  }
-
-  removeConnection(userId) {
+  async removeConnection(userId) {
     const ws = this.connections.get(userId);
     if (ws) {
       try {
-        ws.close();
+        // Reject any pending promises
+        const pendingPromises = this.pendingPromises.get(userId) || [];
+        pendingPromises.forEach(promise => {
+          promise.reject(new Error('Connection closed'));
+        });
+        this.pendingPromises.delete(userId);
+
+        ws.terminate(); // Use terminate instead of close for immediate closure
       } catch (error) {
         console.error(`Error closing WebSocket for user ${userId}:`, error);
       }
     }
     this.connections.delete(userId);
-
-    // Don't clear the message queue immediately, keep it for potential reconnection
     this.setReconnectTimeout(userId);
-  }
-
-  setReconnectTimeout(userId) {
-    // Clear existing timeout if any
-    if (this.reconnectTimeouts.has(userId)) {
-      clearTimeout(this.reconnectTimeouts.get(userId));
-    }
-
-    // Set new timeout
-    const timeout = setTimeout(() => {
-      this.messageQueues.delete(userId);
-      this.processingQueues.delete(userId);
-      this.reconnectTimeouts.delete(userId);
-    }, 5 * 60 * 1000); // 5 minutes timeout
-
-    this.reconnectTimeouts.set(userId, timeout);
-  }
-
-  handleConnectionError(userId) {
-    this.removeConnection(userId);
-    // Pause queue processing but keep messages for potential reconnection
-    this.processingQueues.set(userId, false);
-  }
-
-  isConnected(userId) {
-    const ws = this.connections.get(userId);
-    return ws?.readyState === 1; // WebSocket.OPEN
   }
 
   async queueMessage(userId, messageCallback) {
@@ -89,19 +68,26 @@ class WebSocketManager {
       this.initializeQueue(userId);
     }
 
-    return new Promise((resolve, reject) => {
+    const promise = new Promise((resolve, reject) => {
+      const pendingPromises = this.pendingPromises.get(userId) || [];
+      pendingPromises.push({ resolve, reject });
+      this.pendingPromises.set(userId, pendingPromises);
+
       this.messageQueues.get(userId).push({
         callback: messageCallback,
-        resolve,
-        reject,
         timestamp: Date.now(),
+        promiseIndex: pendingPromises.length - 1,
       });
+    });
 
-      // Start processing if not already processing
+    // Start processing if not already processing
+    setImmediate(() => {
       if (!this.processingQueues.get(userId)) {
         this.processQueue(userId);
       }
     });
+
+    return promise;
   }
 
   async processQueue(userId) {
@@ -111,29 +97,42 @@ class WebSocketManager {
 
     this.processingQueues.set(userId, true);
     const queue = this.messageQueues.get(userId);
+    const pendingPromises = this.pendingPromises.get(userId) || [];
 
     while (queue.length > 0 && this.isConnected(userId)) {
       const message = queue[0];
+      const promise = pendingPromises[message.promiseIndex];
 
       try {
-        // Check if message is too old (> 5 minutes)
+        // Check message timeout
         if (Date.now() - message.timestamp > 5 * 60 * 1000) {
           queue.shift();
-          message.reject(new Error('Message timeout'));
+          if (promise) {
+            promise.reject(new Error('Message timeout'));
+          }
           continue;
         }
 
         await message.callback();
         queue.shift();
-        message.resolve();
+        if (promise) {
+          promise.resolve();
+        }
       } catch (error) {
         console.error(`Error processing message for user ${userId}:`, error);
         queue.shift();
-        message.reject(error);
+        if (promise) {
+          promise.reject(error);
+        }
       }
     }
 
     this.processingQueues.set(userId, false);
+
+    // Clean up pending promises
+    if (queue.length === 0) {
+      this.pendingPromises.delete(userId);
+    }
   }
 
   sendToUser(userId, data) {
@@ -142,25 +141,22 @@ class WebSocketManager {
       return false;
     }
 
-    try {
-      ws.send(JSON.stringify(data));
-      return true;
-    } catch (error) {
-      console.error(`Error sending message to user ${userId}:`, error);
-      this.handleConnectionError(userId);
-      return false;
-    }
-  }
-
-  updateQuizProgress(userId, progressData) {
-    return this.sendToUser(userId, {
-      type: 'quiz_progress',
-      ...progressData,
+    return new Promise((resolve, reject) => {
+      ws.send(JSON.stringify(data), error => {
+        if (error) {
+          console.error(`Error sending message to user ${userId}:`, error);
+          this.handleConnectionError(userId);
+          reject(error);
+        } else {
+          resolve(true);
+        }
+      });
     });
   }
 
-  getActiveConnections() {
-    return Array.from(this.connections.keys());
+  isConnected(userId) {
+    const ws = this.connections.get(userId);
+    return ws?.readyState === 1 && ws?.isAlive === true;
   }
 }
 
