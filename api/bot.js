@@ -186,6 +186,12 @@ const initialize = async () => {
       console.log('Webhook configured:', webhookInfo);
       return webhookInfo;
     } else {
+      if (process.argv.includes('cleanup')) {
+        console.log('Cleaning database...');
+        await clearDatabase();
+        await initializeDatabase();
+        console.log('Database reinitialized with fresh data.');
+      }
       console.log('Starting bot in polling mode...');
       await bot.launch();
       console.log('Bot launched in polling mode');
