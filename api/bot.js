@@ -12,18 +12,36 @@ const { setupActionHandlers } = require('../handlers/actionHandlers');
 // Global bot instance
 let bot = null;
 
-const initBot = () => {
-  console.log('[DEBUG] Starting bot initialization...');
-  console.log('[DEBUG] BOT_TOKEN exists:', !!process.env.BOT_TOKEN);
+let isInitializing = false;
+let lastInitTime = 0;
+const INIT_COOLDOWN = 5000;
 
-  if (!process.env.BOT_TOKEN) {
-    throw new Error('BOT_TOKEN environment variable is not set');
-  }
-
+// Enhanced bot initialization with connection check
+const initBot = async (force = false) => {
   try {
-    const newBot = new Telegraf(process.env.BOT_TOKEN);
+    if (isInitializing) {
+      console.log('[DEBUG] Bot initialization already in progress...');
+      return null;
+    }
 
-    // Set up error handling
+    if (!force && bot && Date.now() - lastInitTime < INIT_COOLDOWN) {
+      console.log('[DEBUG] Using existing bot instance');
+      return bot;
+    }
+
+    isInitializing = true;
+    console.log('[DEBUG] Starting bot initialization...');
+
+    if (!process.env.BOT_TOKEN) {
+      throw new Error('BOT_TOKEN environment variable is not set');
+    }
+
+    // Create new bot instance
+    const newBot = new Telegraf(process.env.BOT_TOKEN, {
+      handlerTimeout: 30000,
+    });
+
+    // Enhanced error handling
     newBot.catch(async (err, ctx) => {
       console.error('[DEBUG] Bot error:', err);
       try {
@@ -33,23 +51,63 @@ const initBot = () => {
       }
     });
 
-    console.log('[DEBUG] Bot instance created successfully');
-    return newBot;
+    // Setup handlers
+    console.log('[DEBUG] Setting up command handlers...');
+    await setupCommandHandlers(newBot);
+
+    console.log('[DEBUG] Setting up action handlers...');
+    await setupActionHandlers(newBot);
+
+    // Verify bot connection
+    await newBot.telegram.getMe();
+
+    bot = newBot;
+    lastInitTime = Date.now();
+    console.log('[DEBUG] Bot initialized successfully');
+    return bot;
   } catch (error) {
-    console.error('[DEBUG] Error in bot initialization:', error);
+    console.error('[DEBUG] Bot initialization error:', error);
     throw error;
+  } finally {
+    isInitializing = false;
   }
 };
 
-const setupWebhook = async domain => {
+// Enhanced database connection with retry
+const ensureDatabaseConnection = async (retries = 3) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      if (mongoose.connection.readyState === 1) {
+        return true;
+      }
+
+      console.log(
+        `[DEBUG] Attempting database connection (attempt ${i + 1}/${retries})`
+      );
+      await connectToDatabase();
+      await initializeDatabase();
+      return true;
+    } catch (error) {
+      console.error(
+        `[DEBUG] Database connection attempt ${i + 1} failed:`,
+        error
+      );
+      if (i === retries - 1) throw error;
+      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // Exponential backoff
+    }
+  }
+  return false;
+};
+
+const setupWebhook = async (currentBot, domain) => {
   try {
     const webhookUrl = `https://${domain}/api/bot`;
     console.log('[DEBUG] Setting webhook URL:', webhookUrl);
 
-    await bot.telegram.deleteWebhook();
-    await bot.telegram.setWebhook(webhookUrl);
+    await currentBot.telegram.deleteWebhook();
+    await currentBot.telegram.setWebhook(webhookUrl);
 
-    const webhookInfo = await bot.telegram.getWebhookInfo();
+    const webhookInfo = await currentBot.telegram.getWebhookInfo();
     console.log('[DEBUG] Webhook info:', webhookInfo);
     return true;
   } catch (error) {
@@ -58,99 +116,93 @@ const setupWebhook = async domain => {
   }
 };
 
-const initializeServices = async () => {
+// Improved webhook handler
+const handler = async (req, res) => {
+  const startTime = Date.now();
+  console.log(
+    '[DEBUG] Received request:',
+    req.method,
+    'Start time:',
+    new Date().toISOString()
+  );
+
   try {
-    console.log('[DEBUG] Starting services initialization...');
-
-    // Connect to database if not connected
-    if (mongoose.connection.readyState !== 1) {
-      console.log('[DEBUG] Connecting to database...');
-      await connectToDatabase();
-
-      if (process.argv.includes('cleanup')) {
-        console.log('[DEBUG] Running database cleanup...');
-        await clearDatabase();
-      }
-
-      await initializeDatabase();
-      console.log('[DEBUG] Database initialized');
-    }
-
-    // Initialize bot if not initialized
-    if (!bot) {
-      console.log('[DEBUG] Creating bot instance...');
-      bot = initBot();
-
-      console.log('[DEBUG] Setting up command handlers...');
-      await setupCommandHandlers(bot);
-
-      console.log('[DEBUG] Setting up action handlers...');
-      await setupActionHandlers(bot);
-
-      console.log('[DEBUG] Bot setup complete');
-    }
-
-    return true;
-  } catch (error) {
-    console.error('[DEBUG] Service initialization error:', error);
-    return false;
-  }
-};
-
-const handler = async (request, response) => {
-  try {
-    console.log('[DEBUG] Received request:', request.method);
-
-    // Health check endpoint - should only check status, not initialize
-    if (request.method === 'GET') {
-      const mongoState = mongoose.connection.readyState;
-      const health = {
+    // Health check endpoint
+    if (req.method === 'GET') {
+      const status = {
         ok: true,
         timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
         database: {
-          state: mongoState,
-          stateString: [
-            'disconnected',
-            'connected',
-            'connecting',
-            'disconnecting',
-          ][mongoState],
+          state: mongoose.connection.readyState,
+          connected: mongoose.connection.readyState === 1,
         },
-        botInitialized: !!bot,
+        bot: {
+          initialized: !!bot,
+          lastInit: lastInitTime ? new Date(lastInitTime).toISOString() : null,
+        },
         environment: process.env.NODE_ENV,
-        vercelUrl: process.env.VERCEL_URL,
       };
-
-      console.log('[DEBUG] Health check:', health);
-      return response.status(200).json(health);
+      return res.status(200).json(status);
     }
 
     // Handle webhook updates
-    if (request.method === 'POST') {
-      console.log('[DEBUG] Received webhook POST from Telegram');
+    if (req.method === 'POST') {
+      console.log('[DEBUG] Processing webhook update...');
 
-      // Initialize everything only on actual Telegram webhooks
-      if (!bot || mongoose.connection.readyState !== 1) {
-        console.log('[DEBUG] Services need initialization...');
-        await initializeServices();
+      // Ensure database connection first
+      await ensureDatabaseConnection();
+
+      // Initialize or get bot instance
+      const currentBot = await initBot();
+      if (!currentBot) {
+        throw new Error('Failed to initialize bot');
       }
 
-      const buf = await rawBody(request);
+      // Parse and process update
+      const buf = await rawBody(req);
       const update = JSON.parse(buf.toString());
+
       console.log(
-        '[DEBUG] Processing update:',
-        JSON.stringify(update, null, 2)
+        '[DEBUG] Update type:',
+        update.message
+          ? 'message'
+          : update.callback_query
+          ? 'callback_query'
+          : 'other'
       );
 
-      await bot.handleUpdate(update);
-      console.log('[DEBUG] Update handled successfully');
-      return response.status(200).json({ ok: true });
+      // Process update with timeout
+      const updatePromise = currentBot.handleUpdate(update);
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Update processing timeout')), 25000)
+      );
+
+      await Promise.race([updatePromise, timeoutPromise]);
+
+      const processingTime = Date.now() - startTime;
+      console.log(
+        '[DEBUG] Update processed successfully, took:',
+        processingTime,
+        'ms'
+      );
+
+      return res.status(200).json({
+        ok: true,
+        processingTime,
+        botInitialized: !!bot,
+        databaseConnected: mongoose.connection.readyState === 1,
+      });
     }
 
-    return response.status(405).json({ error: 'Method not allowed' });
+    return res.status(405).json({ error: 'Method not allowed' });
   } catch (error) {
     console.error('[DEBUG] Handler error:', error);
-    return response.status(200).json({ ok: true });
+    return res.status(200).json({
+      ok: false,
+      error: error.message,
+      processingTime: Date.now() - startTime,
+    });
   }
 };
 
@@ -158,6 +210,7 @@ const handler = async (request, response) => {
 handler.config = {
   api: {
     bodyParser: false,
+    externalResolver: true,
   },
 };
 
@@ -165,11 +218,17 @@ const startLocalBot = async () => {
   try {
     console.log('[DEBUG] Starting bot in local development mode...');
 
-    // Initialize services with local development flag
-    await initializeServices(true);
+    // Ensure database connection
+    await ensureDatabaseConnection();
+
+    // Initialize bot
+    const currentBot = await initBot(true);
+    if (!currentBot) {
+      throw new Error('Failed to initialize bot for local mode');
+    }
 
     // Start bot in polling mode
-    await bot.launch({
+    await currentBot.launch({
       dropPendingUpdates: true,
     });
 
@@ -178,50 +237,41 @@ const startLocalBot = async () => {
     // Enable graceful stop
     process.once('SIGINT', () => {
       console.log('[DEBUG] Received SIGINT signal');
-      bot?.stop('SIGINT');
+      currentBot?.stop('SIGINT');
     });
 
     process.once('SIGTERM', () => {
       console.log('[DEBUG] Received SIGTERM signal');
-      bot?.stop('SIGTERM');
+      currentBot?.stop('SIGTERM');
     });
   } catch (error) {
     console.error('[DEBUG] Failed to start bot in local mode:', error);
-    process.exit(1);
+    throw error;
   }
 };
 
-// Setup webhook in production
+// Environment-specific initialization
 if (process.env.VERCEL_URL && process.env.NODE_ENV === 'production') {
-  console.log('[DEBUG] Production environment detected, initializing...');
-  initializeServices()
-    .then(() => {
-      console.log('[DEBUG] Services initialized, setting up webhook...');
-      return setupWebhook(process.env.VERCEL_URL);
-    })
-    .then(() => {
-      console.log('[DEBUG] Webhook setup complete');
-    })
-    .catch(error => {
-      console.error('[DEBUG] Startup error:', error);
-    });
-}
-// Handle different execution environments
-if (require.main === module) {
-  // Running directly (local development)
+  // Production environment (Vercel)
+  console.log('[DEBUG] Production environment detected, setting up webhook...');
+  (async () => {
+    try {
+      await ensureDatabaseConnection();
+      const currentBot = await initBot(true);
+      if (currentBot) {
+        await setupWebhook(currentBot, process.env.VERCEL_URL);
+      }
+    } catch (error) {
+      console.error('[DEBUG] Production setup error:', error);
+    }
+  })();
+} else if (require.main === module) {
+  // Local development
   console.log('[DEBUG] Starting in local development mode');
   startLocalBot().catch(error => {
     console.error('[DEBUG] Local startup error:', error);
     process.exit(1);
   });
-} else {
-  // Running in production (Vercel)
-  if (process.env.VERCEL_URL && process.env.NODE_ENV === 'production') {
-    console.log('[DEBUG] Production environment detected, initializing...');
-    initializeServices()
-      .then(() => setupWebhook(process.env.VERCEL_URL))
-      .then(() => console.log('[DEBUG] Production setup complete'))
-      .catch(error => console.error('[DEBUG] Production setup error:', error));
-  }
 }
+
 module.exports = handler;

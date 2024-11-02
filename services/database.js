@@ -210,6 +210,32 @@ const resetUserProgress = async userId => {
   }
 };
 
+// Enhanced database connection with retry
+const ensureDatabaseConnection = async (retries = 3) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      if (mongoose.connection.readyState === 1) {
+        return true;
+      }
+
+      console.log(
+        `[DEBUG] Attempting database connection (attempt ${i + 1}/${retries})`
+      );
+      await connectToDatabase();
+      await initializeDatabase();
+      return true;
+    } catch (error) {
+      console.error(
+        `[DEBUG] Database connection attempt ${i + 1} failed:`,
+        error
+      );
+      if (i === retries - 1) throw error;
+      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // Exponential backoff
+    }
+  }
+  return false;
+};
+
 const closeDatabase = async () => {
   try {
     if (mongoose.connection.readyState === 1) {
@@ -230,5 +256,6 @@ module.exports = {
   resetUserProgress,
   hasUserCompletedQuiz,
   closeDatabase,
+  ensureDatabaseConnection,
   isConnected: () => isConnected,
 };

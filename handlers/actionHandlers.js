@@ -135,9 +135,64 @@ const setupActionHandlers = bot => {
     }
   });
 
-  // Enhanced answer handling with guaranteed message flow
+  const sendNextQuestion = async (
+    bot,
+    chatId,
+    quizId,
+    questionIndex,
+    userId
+  ) => {
+    try {
+      const quiz = quizzes[quizId];
+      if (questionIndex < quiz.questions.length) {
+        // Add a small delay before sending next question
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        await sendQuizQuestion(bot, chatId, quizId, questionIndex, userId);
+      } else {
+        // Handle quiz completion
+        const userQuizCollection = mongoose.connection.collection('userQuiz');
+        const userQuiz = await userQuizCollection.findOne({ userId, quizId });
+        const totalQuestions = quiz.questions.length;
+        const userScore = userQuiz?.score || 0;
+        const scorePercentage = Math.round((userScore / totalQuestions) * 100);
+
+        const completionText = [
+          '🎉 *Quiz Completed\\!*',
+          '',
+          '📊 *Your Results:*',
+          `✓ Score: ${userScore}/${totalQuestions} \\(${scorePercentage}%\\)`,
+          scorePercentage === 100
+            ? "🏆 Perfect Score\\! You're eligible for the prize draw\\!"
+            : 'Keep trying to get a perfect score\\!',
+          '',
+          '📋 *Available Commands:*',
+          '/start \\- Start a new quiz',
+          '/help \\- Show all available commands',
+          '/listquizzes \\- Show available quizzes',
+          '/leaderboard \\- View top 10 players',
+        ].join('\n');
+
+        await bot.telegram.sendMessage(chatId, completionText, {
+          parse_mode: 'MarkdownV2',
+          protect_content: true,
+        });
+
+        await userQuizCollection.updateOne(
+          { userId, quizId },
+          { $set: { completed: true } },
+          { upsert: true }
+        );
+      }
+    } catch (error) {
+      console.error('[DEBUG] Error in sendNextQuestion:', error);
+      throw error;
+    }
+  };
+
   bot.action(/q(\d+)_(\d+)_(\d+)_(\d+)/, async ctx => {
     const startTime = Date.now();
+    let resultMessage = null;
+
     try {
       const [_, quizId, questionIndex, answerIndex, userId] =
         ctx.match.map(Number);
@@ -148,6 +203,7 @@ const setupActionHandlers = bot => {
         questionIndex,
         answerIndex,
         userId,
+        messageId: ctx.callbackQuery.message.message_id,
       });
 
       if (userId !== ctx.from.id) {
@@ -155,121 +211,71 @@ const setupActionHandlers = bot => {
         return;
       }
 
-      // Delete the question message
-      if (ctx.callbackQuery.message) {
-        await safeDeleteMessage(
-          bot,
-          chatId,
-          ctx.callbackQuery.message.message_id
-        );
-      }
+      // Delete current question
+      await safeDeleteMessage(
+        bot,
+        chatId,
+        ctx.callbackQuery.message.message_id
+      );
 
       const quiz = quizzes[quizId];
       const questionData = quiz.questions[questionIndex];
       const userAnswer = questionData.options[answerIndex];
       const isCorrect = userAnswer === questionData.correct;
 
-      // Update database
+      // Update database first
       const userQuizCollection = mongoose.connection.collection('userQuiz');
-      if (isCorrect) {
-        await userQuizCollection.updateOne(
-          { userId, quizId },
-          {
-            $inc: { score: 1 },
-            $set: { username: ctx.from.username || 'Anonymous' },
-          },
-          { upsert: true }
-        );
-      }
+      await userQuizCollection.updateOne(
+        { userId, quizId },
+        {
+          $inc: isCorrect ? { score: 1 } : { wrong: 1 },
+          $set: { username: ctx.from.username || 'Anonymous' },
+        },
+        { upsert: true }
+      );
 
-      // Send result message with auto-deletion
-      const resultMsg = await ctx.reply(
+      // Send result message
+      resultMessage = await ctx.reply(
         isCorrect
           ? `✅ Correct answer! 🎉\n\n🔗 Read full article: ${questionData.link}`
           : `❌ Wrong answer!\nThe correct answer was: ${questionData.correct}\n\n🔗 Read full article: ${questionData.link}`,
         { protect_content: true }
       );
 
-      // Notify websocket clients if connected
-      if (wsManager.isConnected(userId)) {
-        wsManager.sendToUser(userId, {
-          type: 'answer_result',
-          correct: isCorrect,
-          questionIndex: questionIndex + 1,
-          totalQuestions: quiz.questions.length,
-          correctAnswer: questionData.correct,
-        });
-      }
+      // Schedule next question immediately but with proper flow
+      const nextQuestionIndex = questionIndex + 1;
 
-      // Schedule result message deletion and next question
+      // Delete result message and send next question
       setTimeout(async () => {
-        await safeDeleteMessage(bot, chatId, resultMsg.message_id);
-
-        const nextQuestionIndex = questionIndex + 1;
-        if (nextQuestionIndex < quiz.questions.length) {
-          await sendQuizQuestion(
+        try {
+          if (resultMessage) {
+            await safeDeleteMessage(bot, chatId, resultMessage.message_id);
+          }
+          await sendNextQuestion(
             bot,
             chatId,
             quizId,
             nextQuestionIndex,
             userId
           );
-        } else {
-          // Quiz completion handling
-          const userQuiz = await userQuizCollection.findOne({ userId, quizId });
-          const totalQuestions = quiz.questions.length;
-          const userScore = userQuiz?.score || 0;
-          const scorePercentage = Math.round(
-            (userScore / totalQuestions) * 100
-          );
-
-          const completionText = [
-            '🎉 *Quiz Completed\\!*',
-            '',
-            '📊 *Your Results:*',
-            `✓ Score: ${userScore}/${totalQuestions} \\(${scorePercentage}%\\)`,
-            scorePercentage === 100
-              ? "🏆 Perfect Score\\! You're eligible for the prize draw\\!"
-              : 'Keep trying to get a perfect score\\!',
-            '',
-            '📋 *Available Commands:*',
-            '/start \\- Start a new quiz',
-            '/help \\- Show all available commands',
-            '/listquizzes \\- Show available quizzes',
-            '/leaderboard \\- View top 10 players',
-          ].join('\n');
-
-          await ctx.reply(completionText, {
-            parse_mode: 'MarkdownV2',
-            protect_content: true,
-          });
-
-          await userQuizCollection.updateOne(
-            { userId, quizId },
-            { $set: { completed: true } },
-            { upsert: true }
-          );
-
-          if (wsManager.isConnected(userId)) {
-            wsManager.sendToUser(userId, {
-              type: 'quiz_completed',
-              score: userScore,
-              totalQuestions,
-              scorePercentage,
-              isPerfectScore: scorePercentage === 100,
-            });
-          }
+        } catch (error) {
+          console.error('[DEBUG] Error in delayed next question:', error);
         }
       }, 2000);
 
       await ctx.answerCbQuery();
       console.log(
-        '[DEBUG] Answer processed successfully, time taken:',
+        '[DEBUG] Answer processed successfully, time:',
         Date.now() - startTime,
         'ms'
       );
     } catch (error) {
       console.error('[DEBUG] Error processing answer:', error);
+      if (resultMessage) {
+        await safeDeleteMessage(bot, chatId, resultMessage.message_id).catch(
+          console.error
+        );
+      }
       await ctx.reply(
         'Sorry, there was an error. Please type /start to begin again.'
       );
