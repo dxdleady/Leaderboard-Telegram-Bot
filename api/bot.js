@@ -101,42 +101,56 @@ const handler = async (request, response) => {
   try {
     console.log('[DEBUG] Received request:', request.method);
 
-    // Health check endpoint - should only return status, not initialize anything
+    // Health check endpoint - should only check status, not initialize
     if (request.method === 'GET') {
+      const mongoState = mongoose.connection.readyState;
       const health = {
         ok: true,
         timestamp: new Date().toISOString(),
-        database:
-          mongoose.connection?.readyState === 1 ? 'connected' : 'disconnected',
+        database: {
+          state: mongoState,
+          stateString: [
+            'disconnected',
+            'connected',
+            'connecting',
+            'disconnecting',
+          ][mongoState],
+        },
         botInitialized: !!bot,
         environment: process.env.NODE_ENV,
         vercelUrl: process.env.VERCEL_URL,
       };
+
+      console.log('[DEBUG] Health check:', health);
       return response.status(200).json(health);
     }
 
     // Handle webhook updates
     if (request.method === 'POST') {
-      console.log('[DEBUG] Received webhook POST');
+      console.log('[DEBUG] Received webhook POST from Telegram');
 
-      // Only initialize on actual webhook calls from Telegram
-      if (!bot) {
-        console.log('[DEBUG] Bot not initialized, initializing services...');
+      // Initialize everything only on actual Telegram webhooks
+      if (!bot || mongoose.connection.readyState !== 1) {
+        console.log('[DEBUG] Services need initialization...');
         await initializeServices();
       }
 
       const buf = await rawBody(request);
       const update = JSON.parse(buf.toString());
-      console.log('[DEBUG] Received update:', update);
+      console.log(
+        '[DEBUG] Processing update:',
+        JSON.stringify(update, null, 2)
+      );
 
       await bot.handleUpdate(update);
+      console.log('[DEBUG] Update handled successfully');
       return response.status(200).json({ ok: true });
     }
 
     return response.status(405).json({ error: 'Method not allowed' });
   } catch (error) {
     console.error('[DEBUG] Handler error:', error);
-    return response.status(200).json({ ok: true }); // Always return 200 to Telegram
+    return response.status(200).json({ ok: true });
   }
 };
 
