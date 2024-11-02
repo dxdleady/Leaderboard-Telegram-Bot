@@ -12,72 +12,50 @@ const {
 
 let bot = null;
 
+// Simplified handler focused on webhook functionality
 const handler = async (req, res) => {
   try {
-    // Handle WebSocket upgrade requests
-    if (req.headers.upgrade?.toLowerCase() === 'websocket') {
-      if (!res.socket.server.ws) {
-        res.socket.server.ws = setupWebSocket(res.socket.server);
-      }
+    console.log('Received request:', req.method);
 
-      res.socket.server.ws.handleUpgrade(
-        req,
-        req.socket,
-        Buffer.alloc(0),
-        ws => {
-          res.socket.server.ws.emit('connection', ws, req);
-        }
-      );
-      return;
-    }
-
-    // Health check endpoint
+    // Health check
     if (req.method === 'GET') {
-      const webhookInfo = await bot.telegram.getWebhookInfo();
-      return res.status(200).json({
-        ok: true,
-        timestamp: new Date().toISOString(),
-        webhook: webhookInfo,
-        botInfo: await bot.telegram.getMe(),
-      });
+      return res.status(200).json({ ok: true, status: 'healthy' });
     }
 
-    // Handle Telegram webhook updates
+    // Handle webhook updates
     if (req.method === 'POST') {
+      // Ensure bot is initialized
+      if (!bot) {
+        bot = initBot();
+      }
+
+      // Parse update
+      let update;
       try {
-        // Get the raw body as a buffer
         const buf = await rawBody(req);
-
-        // Parse the update
-        const update = JSON.parse(buf.toString());
-
+        update = JSON.parse(buf.toString());
         console.log('Received update:', JSON.stringify(update, null, 2));
-
-        // Process update with timeout
-        await Promise.race([
-          bot.handleUpdate(update),
-          new Promise((_, reject) =>
-            setTimeout(
-              () => reject(new Error('Update processing timeout')),
-              8000
-            )
-          ),
-        ]);
-
-        // Always return 200 OK to Telegram
-        return res.status(200).json({ ok: true });
       } catch (error) {
-        console.error('Error processing webhook update:', error);
-        // Still return 200 to prevent Telegram from retrying
+        console.error('Error parsing update:', error);
         return res.status(200).json({ ok: true });
       }
+
+      // Process update
+      try {
+        await bot.handleUpdate(update);
+        console.log('Update processed successfully');
+      } catch (error) {
+        console.error('Error processing update:', error);
+      }
+
+      // Always return 200 to Telegram
+      return res.status(200).json({ ok: true });
     }
 
     // Method not allowed
     return res.status(405).json({ error: 'Method not allowed' });
   } catch (error) {
-    console.error('Critical webhook handler error:', error);
-    // Always return 200 to Telegram
+    console.error('Handler error:', error);
     return res.status(200).json({ ok: true });
   }
 };
@@ -105,35 +83,37 @@ const initBot = () => {
   return newBot;
 };
 
-// Webhook setup function
+// Setup webhook
 const setupWebhook = async domain => {
   try {
+    if (!bot) {
+      bot = initBot();
+    }
+
     const webhookUrl = `https://${domain}/api/bot`;
     console.log('Setting webhook URL:', webhookUrl);
 
-    // Remove existing webhook first
+    // Remove existing webhook
     await bot.telegram.deleteWebhook({ drop_pending_updates: true });
 
-    // Set new webhook
-    const success = await bot.telegram.setWebhook(webhookUrl, {
-      allowed_updates: ['message', 'callback_query'],
-      drop_pending_updates: true,
-      max_connections: 40,
-    });
+    // Set new webhook with minimal configuration
+    await bot.telegram.setWebhook(webhookUrl);
 
-    if (!success) {
-      throw new Error('Failed to set webhook');
-    }
-
+    // Verify webhook
     const webhookInfo = await bot.telegram.getWebhookInfo();
     console.log('Webhook info:', webhookInfo);
 
-    return webhookInfo;
+    return true;
   } catch (error) {
-    console.error('Error setting webhook:', error);
-    throw error;
+    console.error('Webhook setup error:', error);
+    return false;
   }
 };
+
+// Set webhook if not in local environment
+if (process.env.VERCEL_URL && !process.env.NODE_ENV !== 'development') {
+  setupWebhook(process.env.VERCEL_URL).catch(console.error);
+}
 
 // Initialize function
 const initialize = async () => {
