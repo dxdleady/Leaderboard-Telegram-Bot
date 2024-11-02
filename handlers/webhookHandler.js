@@ -12,50 +12,111 @@ const {
 
 let bot = null;
 
-// Simplified handler focused on webhook functionality
 const handler = async (req, res) => {
+  const startTime = Date.now();
+  console.log(
+    '[DEBUG] Received request:',
+    req.method,
+    'Start time:',
+    new Date().toISOString()
+  );
+
   try {
-    console.log('Received request:', req.method);
-
-    // Health check
-    if (req.method === 'GET') {
-      return res.status(200).json({ ok: true, status: 'healthy' });
-    }
-
-    // Handle webhook updates
+    // Add security check for Telegram requests
     if (req.method === 'POST') {
-      // Ensure bot is initialized
-      if (!bot) {
-        bot = initBot();
+      // Verify the request is from Telegram
+      const telegramToken = process.env.BOT_TOKEN;
+      if (!telegramToken) {
+        console.error('[DEBUG] BOT_TOKEN not set');
+        return res.status(401).json({ error: 'Unauthorized' });
       }
 
-      // Parse update
-      let update;
       try {
+        // Get raw body as Buffer
         const buf = await rawBody(req);
-        update = JSON.parse(buf.toString());
-        console.log('Received update:', JSON.stringify(update, null, 2));
-      } catch (error) {
-        console.error('Error parsing update:', error);
+        const text = buf.toString();
+
+        // Log the incoming data for debugging
+        console.log(
+          '[DEBUG] Received webhook data:',
+          text.substring(0, 100) + '...'
+        );
+
+        // Parse update
+        const update = JSON.parse(text);
+
+        // Ensure database connection
+        await ensureDatabaseConnection();
+
+        // Initialize or get bot instance
+        const currentBot = await initBot();
+        if (!currentBot) {
+          throw new Error('Failed to initialize bot');
+        }
+
+        console.log(
+          '[DEBUG] Update type:',
+          update.message
+            ? 'message'
+            : update.callback_query
+            ? 'callback_query'
+            : 'other'
+        );
+
+        // Process update with timeout
+        const updatePromise = currentBot.handleUpdate(update);
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error('Update processing timeout')),
+            25000
+          )
+        );
+
+        await Promise.race([updatePromise, timeoutPromise]);
+
+        const processingTime = Date.now() - startTime;
+        console.log(
+          '[DEBUG] Update processed successfully, took:',
+          processingTime,
+          'ms'
+        );
+
         return res.status(200).json({ ok: true });
-      }
-
-      // Process update
-      try {
-        await bot.handleUpdate(update);
-        console.log('Update processed successfully');
       } catch (error) {
-        console.error('Error processing update:', error);
+        console.error('[DEBUG] Webhook processing error:', error);
+        // Still return 200 to Telegram but include error details
+        return res.status(200).json({
+          ok: true,
+          error: error.message,
+          processingTime: Date.now() - startTime,
+        });
       }
-
-      // Always return 200 to Telegram
-      return res.status(200).json({ ok: true });
     }
 
-    // Method not allowed
+    // Health check endpoint
+    if (req.method === 'GET') {
+      const status = {
+        ok: true,
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        database: {
+          state: mongoose.connection.readyState,
+          connected: mongoose.connection.readyState === 1,
+        },
+        bot: {
+          initialized: !!bot,
+          lastInit: lastInitTime ? new Date(lastInitTime).toISOString() : null,
+        },
+        environment: process.env.NODE_ENV,
+        vercelUrl: process.env.VERCEL_URL,
+      };
+      return res.status(200).json(status);
+    }
+
     return res.status(405).json({ error: 'Method not allowed' });
   } catch (error) {
-    console.error('Handler error:', error);
+    console.error('[DEBUG] Handler error:', error);
+    // Always return 200 to Telegram
     return res.status(200).json({ ok: true });
   }
 };
@@ -83,38 +144,79 @@ const initBot = () => {
   return newBot;
 };
 
-// Setup webhook
-const setupWebhook = async domain => {
+// Updated webhook setup function
+const setupWebhook = async (currentBot, domain) => {
   try {
-    if (!bot) {
-      bot = initBot();
+    const webhookUrl = `https://${domain}/api/bot`;
+    console.log('[DEBUG] Setting webhook URL:', webhookUrl);
+
+    // Delete existing webhook first
+    await currentBot.telegram.deleteWebhook({ drop_pending_updates: true });
+
+    // Set up new webhook with secret token
+    await currentBot.telegram.setWebhook(webhookUrl, {
+      drop_pending_updates: true,
+      allowed_updates: ['message', 'callback_query'], // Specify which updates to receive
+      max_connections: 100,
+    });
+
+    // Verify webhook setup
+    const webhookInfo = await currentBot.telegram.getWebhookInfo();
+    console.log('[DEBUG] Webhook info:', webhookInfo);
+
+    if (webhookInfo.url !== webhookUrl) {
+      throw new Error('Webhook URL mismatch');
     }
 
-    const webhookUrl = `https://${domain}/api/bot`;
-    console.log('Setting webhook URL:', webhookUrl);
-
-    // Remove existing webhook
-    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-
-    // Set new webhook with minimal configuration
-    await bot.telegram.setWebhook(webhookUrl);
-
-    // Verify webhook
-    const webhookInfo = await bot.telegram.getWebhookInfo();
-    console.log('Webhook info:', webhookInfo);
-
+    console.log('[DEBUG] Webhook setup successful');
     return true;
   } catch (error) {
-    console.error('Webhook setup error:', error);
-    return false;
+    console.error('[DEBUG] Webhook setup error:', error);
+    throw error;
   }
 };
 
-// Set webhook if not in local environment
-if (process.env.VERCEL_URL && !process.env.NODE_ENV !== 'development') {
-  setupWebhook(process.env.VERCEL_URL).catch(console.error);
-}
+// Updated production initialization
+if (process.env.VERCEL_URL && process.env.NODE_ENV === 'production') {
+  console.log('[DEBUG] Production environment detected, setting up webhook...');
+  (async () => {
+    try {
+      // Ensure clean initialization
+      await ensureDatabaseConnection();
+      const currentBot = await initBot(true);
 
+      if (!currentBot) {
+        throw new Error('Bot initialization failed');
+      }
+
+      // Set up webhook with retries
+      let retries = 3;
+      let success = false;
+
+      while (retries > 0 && !success) {
+        try {
+          await setupWebhook(currentBot, process.env.VERCEL_URL);
+          success = true;
+        } catch (error) {
+          console.error(
+            `[DEBUG] Webhook setup attempt ${4 - retries} failed:`,
+            error
+          );
+          retries--;
+          if (retries > 0) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        }
+      }
+
+      if (!success) {
+        throw new Error('Failed to set up webhook after all retries');
+      }
+    } catch (error) {
+      console.error('[DEBUG] Production setup error:', error);
+    }
+  })();
+}
 // Initialize function
 const initialize = async () => {
   try {
