@@ -18,6 +18,57 @@ const { setupActionHandlers } = require('../handlers/actionHandlers');
 let bot;
 let wss;
 
+// Export config for Vercel
+module.exports = async (req, res) => {
+  try {
+    // Handle WebSocket upgrade requests
+    if (req.headers.upgrade?.toLowerCase() === 'websocket') {
+      if (!res.socket.server.ws) {
+        // Initialize WebSocket server
+        const server = createServer();
+        const wss = new WebSocketServer({ noServer: true });
+        res.socket.server.ws = wss;
+
+        wss.on('connection', (ws, req) => {
+          const userId = getUserIdFromRequest(req);
+          if (userId) {
+            wsManager.addConnection(userId, ws);
+          } else {
+            ws.close(1008, 'UserId is required');
+          }
+        });
+      }
+
+      res.socket.server.ws.handleUpgrade(
+        req,
+        req.socket,
+        Buffer.alloc(0),
+        ws => {
+          res.socket.server.ws.emit('connection', ws, req);
+        }
+      );
+      return;
+    }
+
+    // Handle regular bot updates
+    await bot(req, res);
+  } catch (error) {
+    console.error('API route error:', error);
+    res.status(200).json({ ok: true }); // Always return 200 to Telegram
+  }
+};
+
+function getUserIdFromRequest(req) {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const userId = url.searchParams.get('userId');
+    return userId ? parseInt(userId) : null;
+  } catch (error) {
+    console.error('Error parsing userId from request:', error);
+    return null;
+  }
+}
+
 const setupWebSocketServer = server => {
   wss = new WebSocketServer({
     server,
@@ -282,3 +333,10 @@ handler.config = {
 };
 
 module.exports = handler;
+
+module.exports.config = {
+  api: {
+    bodyParser: false,
+    externalResolver: true,
+  },
+};
