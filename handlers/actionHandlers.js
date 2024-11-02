@@ -1,3 +1,4 @@
+// handlers/actionHandlers.js
 const { escapeMarkdown } = require('../utils/helpers');
 const {
   userSessions,
@@ -7,35 +8,7 @@ const {
 const { quizzes } = require('../config/quizData');
 const { Markup } = require('telegraf');
 const mongoose = require('mongoose');
-
-// Single message queue implementation
-const messageQueues = new Map();
-
-// Helper function to manage message queue
-const queueMessage = async (userId, action) => {
-  if (!messageQueues.has(userId)) {
-    messageQueues.set(userId, Promise.resolve());
-  }
-
-  const queue = messageQueues.get(userId);
-  const newPromise = queue.then(async () => {
-    try {
-      await action();
-      // Small delay between messages
-      await new Promise(resolve => setTimeout(resolve, 500));
-    } catch (error) {
-      console.error('Error in queued message:', error);
-    }
-  });
-
-  messageQueues.set(userId, newPromise);
-  return newPromise;
-};
-
-// Clear queue for user
-const clearUserQueue = userId => {
-  messageQueues.delete(userId);
-};
+const wsManager = require('../services/websocketManager');
 
 // Safe message deletion
 const safeDeleteMessage = async (bot, chatId, messageId) => {
@@ -54,7 +27,7 @@ async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
   const quiz = quizzes[quizId];
   const questionData = quiz.questions[questionIndex];
 
-  await queueMessage(userId, async () => {
+  await wsManager.queueMessage(userId, async () => {
     try {
       if (!quiz || !questionData) {
         await bot.telegram.sendMessage(
@@ -67,7 +40,6 @@ async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
         return;
       }
 
-      // Delete previous message if exists
       if (userSession.lastMessageId) {
         await safeDeleteMessage(bot, chatId, userSession.lastMessageId);
       }
@@ -94,9 +66,18 @@ async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
       userSession.lastMessageId = message.message_id;
       userSession.currentQuizId = quizId;
       userSession.currentQuestionIndex = questionIndex;
+
+      // Notify through WebSocket
+      if (wsManager.isConnected(userId)) {
+        wsManager.sendToUser(userId, {
+          type: 'quiz_progress',
+          currentQuestion: questionIndex + 1,
+          totalQuestions: quiz.questions.length,
+        });
+      }
     } catch (error) {
       console.error('Error sending quiz question:', error);
-      clearUserQueue(userId);
+      wsManager.clearQueue(userId);
       await bot.telegram.sendMessage(
         chatId,
         'Error sending quiz question. Please try /start to begin again.',
@@ -129,10 +110,18 @@ const setupActionHandlers = bot => {
         return;
       }
 
-      await queueMessage(userId, async () => {
+      await wsManager.queueMessage(userId, async () => {
         await ctx.reply(`Starting quiz: ${quiz.title}`, {
           protect_content: true,
         });
+
+        if (wsManager.isConnected(userId)) {
+          wsManager.sendToUser(userId, {
+            type: 'quiz_started',
+            quizId,
+            title: quiz.title,
+          });
+        }
       });
 
       await new Promise(resolve => setTimeout(resolve, 1000));
@@ -144,7 +133,7 @@ const setupActionHandlers = bot => {
     }
   });
 
-  // Quiz answer action
+  // Quiz answer action handling remains the same but with WebSocket notifications
   bot.action(/q(\d+)_(\d+)_(\d+)_(\d+)/, async ctx => {
     try {
       const [_, quizId, questionIndex, answerIndex, userId] = ctx.match;
@@ -155,7 +144,7 @@ const setupActionHandlers = bot => {
         return;
       }
 
-      clearUserQueue(userId);
+      wsManager.clearQueue(userId);
       const quiz = quizzes[quizId];
       const questionData = quiz.questions[questionIndex];
       const userAnswer = questionData.options[answerIndex];
@@ -163,7 +152,7 @@ const setupActionHandlers = bot => {
       await ctx.deleteMessage().catch(console.error);
       const userQuizCollection = mongoose.connection.collection('userQuiz');
 
-      await queueMessage(userId, async () => {
+      await wsManager.queueMessage(userId, async () => {
         if (userAnswer === questionData.correct) {
           const msg = await ctx.reply(
             `✅ Correct answer! 🎉\n\n🔗 Read full article: ${questionData.link}`,
@@ -176,6 +165,16 @@ const setupActionHandlers = bot => {
             { upsert: true }
           );
 
+          if (wsManager.isConnected(userId)) {
+            wsManager.sendToUser(userId, {
+              type: 'answer_result',
+              correct: true,
+              score: await userQuizCollection
+                .findOne({ userId: parseInt(userId), quizId: parseInt(quizId) })
+                .then(doc => doc.score),
+            });
+          }
+
           setTimeout(
             () => safeDeleteMessage(bot, chatId, msg.message_id),
             3000
@@ -185,6 +184,14 @@ const setupActionHandlers = bot => {
             `❌ Wrong answer!\nThe correct answer was: ${questionData.correct}\n\n🔗 Read full article: ${questionData.link}`,
             { protect_content: true }
           );
+
+          if (wsManager.isConnected(userId)) {
+            wsManager.sendToUser(userId, {
+              type: 'answer_result',
+              correct: false,
+              correctAnswer: questionData.correct,
+            });
+          }
 
           setTimeout(
             () => safeDeleteMessage(bot, chatId, msg.message_id),
@@ -228,19 +235,28 @@ const setupActionHandlers = bot => {
           protect_content: true,
         });
 
+        if (wsManager.isConnected(userId)) {
+          wsManager.sendToUser(userId, {
+            type: 'quiz_completed',
+            score: userScore,
+            totalQuestions,
+            scorePercentage,
+            isPerfectScore: scorePercentage === 100,
+          });
+        }
+
         await userQuizCollection.updateOne(
           { userId: parseInt(userId), quizId: parseInt(quizId) },
           { $set: { completed: true } },
           { upsert: true }
         );
 
-        clearUserQueue(userId);
+        wsManager.clearQueue(userId);
       }
 
       await ctx.answerCbQuery();
     } catch (error) {
-      console.error('Error handling quiz answer:', error);
-      clearUserQueue(userId);
+      wsManager.clearQueue(userId);
       await ctx.reply(
         'Sorry, there was an error. Please try /start to begin again.'
       );
@@ -250,15 +266,6 @@ const setupActionHandlers = bot => {
 
   return bot;
 };
-
-// Cleanup stale queues periodically
-setInterval(() => {
-  for (const [userId, queue] of messageQueues.entries()) {
-    if (!queue) {
-      messageQueues.delete(userId);
-    }
-  }
-}, 5 * 60 * 1000);
 
 module.exports = {
   setupActionHandlers,
