@@ -1,97 +1,161 @@
 // services/websocketManager.js
-const WebSocket = require('ws');
-const { EventEmitter } = require('events');
-
-class WebSocketManager extends EventEmitter {
+class WebSocketManager {
   constructor() {
-    super();
     this.connections = new Map();
-    this.lastPing = new Map();
+    this.messageQueues = new Map();
+    this.processingQueues = new Map();
+    this.reconnectTimeouts = new Map();
   }
 
   addConnection(userId, ws) {
-    // Close existing connection if any
-    if (this.connections.has(userId)) {
-      const existingWs = this.connections.get(userId);
-      if (existingWs.readyState === WebSocket.OPEN) {
-        existingWs.close();
-      }
+    // Clear any existing reconnect timeout
+    if (this.reconnectTimeouts.has(userId)) {
+      clearTimeout(this.reconnectTimeouts.get(userId));
+      this.reconnectTimeouts.delete(userId);
     }
 
+    // Close existing connection if any
+    this.removeConnection(userId);
+
+    // Set up the new connection
     this.connections.set(userId, ws);
-    this.lastPing.set(userId, Date.now());
+    this.initializeQueue(userId);
 
-    ws.on('close', () => this.removeConnection(userId));
-    ws.on('error', () => this.removeConnection(userId));
-    ws.on('pong', () => this.lastPing.set(userId, Date.now()));
+    // Set up error handling
+    ws.on('error', error => {
+      console.error(`WebSocket error for user ${userId}:`, error);
+      this.handleConnectionError(userId);
+    });
 
-    this.setupHeartbeat(userId, ws);
+    ws.on('close', () => {
+      this.handleConnectionError(userId);
+    });
 
-    ws.send(
-      JSON.stringify({
-        type: 'connection',
-        status: 'connected',
-        timestamp: Date.now(),
-      })
-    );
+    // Process any pending messages
+    this.processQueue(userId);
+  }
+
+  initializeQueue(userId) {
+    if (!this.messageQueues.has(userId)) {
+      this.messageQueues.set(userId, []);
+    }
+    this.processingQueues.set(userId, false);
   }
 
   removeConnection(userId) {
     const ws = this.connections.get(userId);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.close();
+    if (ws) {
+      try {
+        ws.close();
+      } catch (error) {
+        console.error(`Error closing WebSocket for user ${userId}:`, error);
+      }
     }
     this.connections.delete(userId);
-    this.lastPing.delete(userId);
+
+    // Don't clear the message queue immediately, keep it for potential reconnection
+    this.setReconnectTimeout(userId);
   }
 
-  setupHeartbeat(userId, ws) {
-    const interval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        const lastPing = this.lastPing.get(userId);
-        if (Date.now() - lastPing > 30000) {
-          // 30 seconds timeout
-          this.removeConnection(userId);
-          clearInterval(interval);
-        } else {
-          ws.ping();
-        }
-      } else {
-        clearInterval(interval);
-      }
-    }, 15000); // Check every 15 seconds
+  setReconnectTimeout(userId) {
+    // Clear existing timeout if any
+    if (this.reconnectTimeouts.has(userId)) {
+      clearTimeout(this.reconnectTimeouts.get(userId));
+    }
 
-    ws.on('close', () => clearInterval(interval));
+    // Set new timeout
+    const timeout = setTimeout(() => {
+      this.messageQueues.delete(userId);
+      this.processingQueues.delete(userId);
+      this.reconnectTimeouts.delete(userId);
+    }, 5 * 60 * 1000); // 5 minutes timeout
+
+    this.reconnectTimeouts.set(userId, timeout);
+  }
+
+  handleConnectionError(userId) {
+    this.removeConnection(userId);
+    // Pause queue processing but keep messages for potential reconnection
+    this.processingQueues.set(userId, false);
   }
 
   isConnected(userId) {
     const ws = this.connections.get(userId);
-    return ws && ws.readyState === WebSocket.OPEN;
+    return ws?.readyState === 1; // WebSocket.OPEN
   }
 
-  sendToUser(userId, message) {
-    const ws = this.connections.get(userId);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.send(
-          JSON.stringify({
-            ...message,
-            timestamp: Date.now(),
-          })
-        );
-      } catch (error) {
-        console.error(
-          `Error sending WebSocket message to user ${userId}:`,
-          error
-        );
+  async queueMessage(userId, messageCallback) {
+    if (!this.messageQueues.has(userId)) {
+      this.initializeQueue(userId);
+    }
+
+    return new Promise((resolve, reject) => {
+      this.messageQueues.get(userId).push({
+        callback: messageCallback,
+        resolve,
+        reject,
+        timestamp: Date.now(),
+      });
+
+      // Start processing if not already processing
+      if (!this.processingQueues.get(userId)) {
+        this.processQueue(userId);
       }
+    });
+  }
+
+  async processQueue(userId) {
+    if (!this.messageQueues.has(userId) || this.processingQueues.get(userId)) {
+      return;
+    }
+
+    this.processingQueues.set(userId, true);
+    const queue = this.messageQueues.get(userId);
+
+    while (queue.length > 0 && this.isConnected(userId)) {
+      const message = queue[0];
+
+      try {
+        // Check if message is too old (> 5 minutes)
+        if (Date.now() - message.timestamp > 5 * 60 * 1000) {
+          queue.shift();
+          message.reject(new Error('Message timeout'));
+          continue;
+        }
+
+        await message.callback();
+        queue.shift();
+        message.resolve();
+      } catch (error) {
+        console.error(`Error processing message for user ${userId}:`, error);
+        queue.shift();
+        message.reject(error);
+      }
+    }
+
+    this.processingQueues.set(userId, false);
+  }
+
+  sendToUser(userId, data) {
+    const ws = this.connections.get(userId);
+    if (!ws || ws.readyState !== 1) {
+      return false;
+    }
+
+    try {
+      ws.send(JSON.stringify(data));
+      return true;
+    } catch (error) {
+      console.error(`Error sending message to user ${userId}:`, error);
+      this.handleConnectionError(userId);
+      return false;
     }
   }
 
-  updateQuizProgress(userId, data) {
-    this.sendToUser(userId, {
+  updateQuizProgress(userId, progressData) {
+    return this.sendToUser(userId, {
       type: 'quiz_progress',
-      ...data,
+      ...progressData,
     });
   }
 
@@ -100,5 +164,4 @@ class WebSocketManager extends EventEmitter {
   }
 }
 
-const wsManager = new WebSocketManager();
-module.exports = wsManager;
+module.exports = new WebSocketManager();
