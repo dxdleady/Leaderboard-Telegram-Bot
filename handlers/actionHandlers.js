@@ -10,7 +10,6 @@ const { Markup } = require('telegraf');
 const mongoose = require('mongoose');
 const wsManager = require('../services/websocketManager');
 
-// Safe message deletion
 const safeDeleteMessage = async (bot, chatId, messageId) => {
   if (!messageId) return;
   try {
@@ -23,74 +22,60 @@ const safeDeleteMessage = async (bot, chatId, messageId) => {
 };
 
 async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
-  const userSession = getUserSession(userId);
   const quiz = quizzes[quizId];
   const questionData = quiz.questions[questionIndex];
+  const userSession = getUserSession(userId);
 
-  // Create a promise that resolves when the message is sent
-  const sendMessagePromise = new Promise(async (resolve, reject) => {
-    try {
-      if (!quiz || !questionData) {
-        await bot.telegram.sendMessage(
-          chatId,
-          'Error: Quiz or question not found.',
-          {
-            protect_content: true,
-          }
-        );
-        return resolve();
-      }
-
-      if (userSession.lastMessageId) {
-        await safeDeleteMessage(bot, chatId, userSession.lastMessageId);
-      }
-
-      const messageText = [
-        `📝 *Question ${questionIndex + 1} of ${quiz.questions.length}*`,
-        '',
-        escapeMarkdown(questionData.question),
-        '',
-        `🔗 [Read full article](${escapeMarkdown(questionData.link)})`,
-      ].join('\n');
-
-      const buttons = questionData.options.map((option, index) => {
-        const callbackData = `q${quizId}_${questionIndex}_${index}_${userId}`;
-        return [Markup.button.callback(option, callbackData)];
-      });
-
-      const message = await bot.telegram.sendMessage(chatId, messageText, {
-        parse_mode: 'MarkdownV2',
-        ...Markup.inlineKeyboard(buttons),
-        protect_content: true,
-      });
-
-      userSession.lastMessageId = message.message_id;
-      userSession.currentQuizId = quizId;
-      userSession.currentQuestionIndex = questionIndex;
-
-      if (wsManager.isConnected(userId)) {
-        wsManager.sendToUser(userId, {
-          type: 'quiz_progress',
-          currentQuestion: questionIndex + 1,
-          totalQuestions: quiz.questions.length,
-        });
-      }
-
-      resolve();
-    } catch (error) {
-      console.error('Error sending quiz question:', error);
-      wsManager.clearQueue(userId);
+  const sendQuestion = async () => {
+    if (!quiz || !questionData) {
       await bot.telegram.sendMessage(
         chatId,
-        'Error sending quiz question. Please try /start to begin again.',
-        { protect_content: true }
+        'Error: Quiz or question not found.',
+        {
+          protect_content: true,
+        }
       );
-      reject(error);
+      return;
     }
-  });
 
-  // Queue the message sending
-  await wsManager.queueMessage(userId, () => sendMessagePromise);
+    // Delete previous message if exists
+    if (userSession.lastMessageId) {
+      await safeDeleteMessage(bot, chatId, userSession.lastMessageId);
+    }
+
+    const messageText = [
+      `📝 *Question ${questionIndex + 1} of ${quiz.questions.length}*`,
+      '',
+      escapeMarkdown(questionData.question),
+      '',
+      `🔗 [Read full article](${escapeMarkdown(questionData.link)})`,
+    ].join('\n');
+
+    const buttons = questionData.options.map((option, index) => {
+      const callbackData = `q${quizId}_${questionIndex}_${index}_${userId}`;
+      return [Markup.button.callback(option, callbackData)];
+    });
+
+    const message = await bot.telegram.sendMessage(chatId, messageText, {
+      parse_mode: 'MarkdownV2',
+      ...Markup.inlineKeyboard(buttons),
+      protect_content: true,
+    });
+
+    userSession.lastMessageId = message.message_id;
+    userSession.currentQuizId = quizId;
+    userSession.currentQuestionIndex = questionIndex;
+
+    if (wsManager.isConnected(userId)) {
+      wsManager.sendToUser(userId, {
+        type: 'quiz_progress',
+        currentQuestion: questionIndex + 1,
+        totalQuestions: quiz.questions.length,
+      });
+    }
+  };
+
+  await wsManager.queueMessage(userId, sendQuestion);
 }
 
 const setupActionHandlers = bot => {
@@ -105,8 +90,8 @@ const setupActionHandlers = bot => {
         return;
       }
 
+      wsManager.clearQueue(userId);
       await ctx.deleteMessage().catch(console.error);
-      wsManager.clearQueue(userId); // Clear any existing queue
 
       const quiz = quizzes[quizId];
       if (!quiz) {
@@ -116,26 +101,18 @@ const setupActionHandlers = bot => {
         return;
       }
 
-      // Queue the start message
+      // Send start message
       await wsManager.queueMessage(userId, async () => {
         await ctx.reply(`Starting quiz: ${quiz.title}`, {
           protect_content: true,
         });
-
-        if (wsManager.isConnected(userId)) {
-          wsManager.sendToUser(userId, {
-            type: 'quiz_started',
-            quizId,
-            title: quiz.title,
-          });
-        }
       });
 
-      // Wait a bit before sending the first question
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // Send first question after a delay
+      await wsManager.queueMessage(userId, async () => {
+        await sendQuizQuestion(bot, chatId, quizId, 0, userId);
+      });
 
-      // Send first question
-      await sendQuizQuestion(bot, chatId, quizId, 0, userId);
       await ctx.answerCbQuery();
     } catch (error) {
       console.error('Error handling start quiz button:', error);
@@ -143,7 +120,6 @@ const setupActionHandlers = bot => {
     }
   });
 
-  // Quiz answer action handling remains the same but with WebSocket notifications
   bot.action(/q(\d+)_(\d+)_(\d+)_(\d+)/, async ctx => {
     try {
       const [_, quizId, questionIndex, answerIndex, userId] = ctx.match;
@@ -155,13 +131,14 @@ const setupActionHandlers = bot => {
       }
 
       wsManager.clearQueue(userId);
+      await ctx.deleteMessage().catch(console.error);
+
       const quiz = quizzes[quizId];
       const questionData = quiz.questions[questionIndex];
       const userAnswer = questionData.options[answerIndex];
-
-      await ctx.deleteMessage().catch(console.error);
       const userQuizCollection = mongoose.connection.collection('userQuiz');
 
+      // Handle answer
       await wsManager.queueMessage(userId, async () => {
         if (userAnswer === questionData.correct) {
           const msg = await ctx.reply(
@@ -175,19 +152,9 @@ const setupActionHandlers = bot => {
             { upsert: true }
           );
 
-          if (wsManager.isConnected(userId)) {
-            wsManager.sendToUser(userId, {
-              type: 'answer_result',
-              correct: true,
-              score: await userQuizCollection
-                .findOne({ userId: parseInt(userId), quizId: parseInt(quizId) })
-                .then(doc => doc.score),
-            });
-          }
-
           setTimeout(
             () => safeDeleteMessage(bot, chatId, msg.message_id),
-            3000
+            2000
           );
         } else {
           const msg = await ctx.reply(
@@ -195,74 +162,64 @@ const setupActionHandlers = bot => {
             { protect_content: true }
           );
 
-          if (wsManager.isConnected(userId)) {
-            wsManager.sendToUser(userId, {
-              type: 'answer_result',
-              correct: false,
-              correctAnswer: questionData.correct,
-            });
-          }
-
           setTimeout(
             () => safeDeleteMessage(bot, chatId, msg.message_id),
-            3000
+            2000
           );
         }
       });
 
-      await new Promise(resolve => setTimeout(resolve, 3000));
-
-      const nextQuestionIndex = parseInt(questionIndex) + 1;
-      if (nextQuestionIndex < quiz.questions.length) {
-        await sendQuizQuestion(bot, chatId, quizId, nextQuestionIndex, userId);
-      } else {
-        const userQuiz = await userQuizCollection.findOne({
-          userId: parseInt(userId),
-          quizId: parseInt(quizId),
-        });
-
-        const totalQuestions = quiz.questions.length;
-        const userScore = userQuiz?.score || 0;
-        const scorePercentage = Math.round((userScore / totalQuestions) * 100);
-
-        const completionText = [
-          '🎉 *Quiz Completed\\!*',
-          '',
-          '📊 *Your Results:*',
-          `✓ Score: ${userScore}/${totalQuestions} \\(${scorePercentage}%\\)`,
-          scorePercentage === 100
-            ? "🏆 Perfect Score\\! You're eligible for the prize draw\\!"
-            : 'Keep trying to get a perfect score\\!',
-          '',
-          '📋 *Available Commands:*',
-          '/help \\- Show all available commands',
-          '/listquizzes \\- Show available quizzes',
-          '/leaderboard \\- View top 10 players',
-        ].join('\n');
-
-        await ctx.reply(completionText, {
-          parse_mode: 'MarkdownV2',
-          protect_content: true,
-        });
-
-        if (wsManager.isConnected(userId)) {
-          wsManager.sendToUser(userId, {
-            type: 'quiz_completed',
-            score: userScore,
-            totalQuestions,
-            scorePercentage,
-            isPerfectScore: scorePercentage === 100,
+      // Send next question or completion message
+      await wsManager.queueMessage(userId, async () => {
+        const nextQuestionIndex = parseInt(questionIndex) + 1;
+        if (nextQuestionIndex < quiz.questions.length) {
+          await sendQuizQuestion(
+            bot,
+            chatId,
+            quizId,
+            nextQuestionIndex,
+            userId
+          );
+        } else {
+          // Handle quiz completion
+          const userQuiz = await userQuizCollection.findOne({
+            userId: parseInt(userId),
+            quizId: parseInt(quizId),
           });
+
+          const totalQuestions = quiz.questions.length;
+          const userScore = userQuiz?.score || 0;
+          const scorePercentage = Math.round(
+            (userScore / totalQuestions) * 100
+          );
+
+          const completionText = [
+            '🎉 *Quiz Completed\\!*',
+            '',
+            '📊 *Your Results:*',
+            `✓ Score: ${userScore}/${totalQuestions} \\(${scorePercentage}%\\)`,
+            scorePercentage === 100
+              ? "🏆 Perfect Score\\! You're eligible for the prize draw\\!"
+              : 'Keep trying to get a perfect score\\!',
+            '',
+            '📋 *Available Commands:*',
+            '/help \\- Show all available commands',
+            '/listquizzes \\- Show available quizzes',
+            '/leaderboard \\- View top 10 players',
+          ].join('\n');
+
+          await ctx.reply(completionText, {
+            parse_mode: 'MarkdownV2',
+            protect_content: true,
+          });
+
+          await userQuizCollection.updateOne(
+            { userId: parseInt(userId), quizId: parseInt(quizId) },
+            { $set: { completed: true } },
+            { upsert: true }
+          );
         }
-
-        await userQuizCollection.updateOne(
-          { userId: parseInt(userId), quizId: parseInt(quizId) },
-          { $set: { completed: true } },
-          { upsert: true }
-        );
-
-        wsManager.clearQueue(userId);
-      }
+      });
 
       await ctx.answerCbQuery();
     } catch (error) {
