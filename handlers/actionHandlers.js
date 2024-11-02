@@ -3,6 +3,7 @@ const { escapeMarkdown } = require('../utils/helpers');
 const { quizzes } = require('../config/quizData');
 const { Markup } = require('telegraf');
 const mongoose = require('mongoose');
+const { hasUserCompletedQuiz } = require('../services/database');
 const wsManager = require('../services/websocketManager');
 
 const safeDeleteMessage = async (bot, chatId, messageId) => {
