@@ -2,6 +2,7 @@ const { Telegraf } = require('telegraf');
 const rawBody = require('raw-body');
 const mongoose = require('mongoose');
 const {
+  clearDatabase,
   connectToDatabase,
   initializeDatabase,
 } = require('../services/database');
@@ -45,37 +46,87 @@ const initBot = () => {
   }
 };
 
+const connectToDatabase = async () => {
+  try {
+    console.log('[DEBUG] Starting database connection...');
+
+    if (!process.env.MONGODB_URI) {
+      console.error('[DEBUG] MONGODB_URI is not set in environment variables');
+      throw new Error('MONGODB_URI environment variable is not set');
+    }
+
+    console.log(
+      '[DEBUG] MONGODB_URI exists and starts with:',
+      process.env.MONGODB_URI.substring(0, 20) + '...'
+    );
+
+    // Configure mongoose
+    mongoose.set('strictQuery', false);
+
+    const mongooseOptions = {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      serverSelectionTimeoutMS: 10000,
+      heartbeatFrequencyMS: 2000,
+    };
+
+    // Set up mongoose connection event handlers
+    mongoose.connection.on('connecting', () => {
+      console.log('[DEBUG] MongoDB is connecting...');
+    });
+
+    mongoose.connection.on('connected', () => {
+      console.log('[DEBUG] MongoDB connected successfully!');
+    });
+
+    mongoose.connection.on('disconnected', () => {
+      console.error('[DEBUG] MongoDB disconnected!');
+    });
+
+    mongoose.connection.on('error', err => {
+      console.error('[DEBUG] MongoDB connection error:', err);
+    });
+
+    console.log('[DEBUG] Attempting to connect to MongoDB...');
+    await mongoose.connect(process.env.MONGODB_URI, mongooseOptions);
+
+    const connectionState = mongoose.connection.readyState;
+    console.log('[DEBUG] Connection state after connect:', connectionState);
+
+    if (connectionState !== 1) {
+      throw new Error(
+        `Failed to connect to MongoDB. Connection state: ${connectionState}`
+      );
+    }
+
+    console.log('[DEBUG] MongoDB connection verified and ready!');
+    return true;
+  } catch (error) {
+    console.error('[DEBUG] Database connection error full details:', {
+      message: error.message,
+      stack: error.stack,
+      code: error.code,
+      name: error.name,
+    });
+    throw error;
+  }
+};
+
 const setupWebhook = async domain => {
   try {
-    console.log('[DEBUG] Setting up webhook for domain:', domain);
-
     if (!bot) {
-      console.log(
-        '[DEBUG] Bot not initialized during webhook setup. Initializing...'
-      );
-      bot = initBot();
+      console.error('[DEBUG] Bot not initialized during webhook setup');
+      return false;
     }
 
     const webhookUrl = `https://${domain}/api/bot`;
     console.log('[DEBUG] Setting webhook URL:', webhookUrl);
 
-    // Test bot connection before setting webhook
-    try {
-      const botInfo = await bot.telegram.getMe();
-      console.log('[DEBUG] Bot info:', botInfo);
-    } catch (error) {
-      console.error('[DEBUG] Failed to get bot info:', error);
-      return false;
-    }
-
     await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-    const success = await bot.telegram.setWebhook(webhookUrl);
-
-    console.log('[DEBUG] Webhook set success:', success);
+    await bot.telegram.setWebhook(webhookUrl);
 
     const webhookInfo = await bot.telegram.getWebhookInfo();
     console.log('[DEBUG] Webhook info:', webhookInfo);
-
     return true;
   } catch (error) {
     console.error('[DEBUG] Webhook setup error:', error);
@@ -87,26 +138,28 @@ const initializeServices = async () => {
   try {
     console.log('[DEBUG] Starting services initialization...');
 
-    // Connect to database if not already connected
+    // Always attempt to connect to database if not connected
     if (mongoose.connection.readyState !== 1) {
-      console.log('[DEBUG] Connecting to database...');
+      console.log(
+        '[DEBUG] Database not connected. Current state:',
+        mongoose.connection.readyState
+      );
       await connectToDatabase();
 
-      // Database cleanup if needed
       if (process.argv.includes('cleanup')) {
-        console.log('[DEBUG] Cleanup flag detected, cleaning database...');
+        console.log('[DEBUG] Running database cleanup...');
         await clearDatabase();
-        console.log('[DEBUG] Database cleanup complete');
       }
 
       await initializeDatabase();
-      console.log(
-        '[DEBUG] Database connection status:',
-        mongoose.connection.readyState
-      );
     }
 
-    // Initialize bot if not already initialized
+    console.log('[DEBUG] Final database state:', {
+      readyState: mongoose.connection.readyState,
+      host: mongoose.connection.host,
+      name: mongoose.connection.name,
+    });
+
     if (!bot) {
       console.log('[DEBUG] Initializing bot...');
       bot = initBot();
@@ -121,21 +174,73 @@ const initializeServices = async () => {
     return false;
   }
 };
+
+const startPolling = async () => {
+  try {
+    console.log('[DEBUG] Starting bot in polling mode...');
+    await bot.launch({
+      dropPendingUpdates: true,
+      polling: {
+        timeout: 30,
+        limit: 100,
+      },
+    });
+    console.log('[DEBUG] Bot is running in polling mode');
+
+    process.once('SIGINT', () => {
+      console.log('[DEBUG] SIGINT received, stopping bot...');
+      bot.stop('SIGINT');
+    });
+
+    process.once('SIGTERM', () => {
+      console.log('[DEBUG] SIGTERM received, stopping bot...');
+      bot.stop('SIGTERM');
+    });
+
+    return true;
+  } catch (error) {
+    console.error('[DEBUG] Error starting polling mode:', error);
+    throw error;
+  }
+};
+
 const handler = async (request, response) => {
   try {
     console.log('[DEBUG] Received request:', request.method);
 
     if (request.method === 'GET') {
+      // Try to connect if disconnected
+      if (mongoose.connection.readyState !== 1) {
+        console.log(
+          '[DEBUG] Database disconnected during health check, attempting connection...'
+        );
+        await connectToDatabase();
+      }
+
       const health = {
         ok: true,
         timestamp: new Date().toISOString(),
-        database:
-          mongoose.connection?.readyState === 1 ? 'connected' : 'disconnected',
+        database: {
+          state: mongoose.connection.readyState,
+          stateString:
+            ['disconnected', 'connected', 'connecting', 'disconnecting'][
+              mongoose.connection.readyState
+            ] || 'unknown',
+          host: mongoose.connection.host,
+          name: mongoose.connection.name,
+          uri: process.env.MONGODB_URI
+            ? `${process.env.MONGODB_URI.substring(0, 20)}...`
+            : 'not set',
+        },
         botInitialized: !!bot,
         environment: process.env.NODE_ENV,
         vercelUrl: process.env.VERCEL_URL,
       };
-      console.log('[DEBUG] Health check:', health);
+
+      console.log(
+        '[DEBUG] Health check details:',
+        JSON.stringify(health, null, 2)
+      );
       return response.status(200).json(health);
     }
 
@@ -154,12 +259,6 @@ const handler = async (request, response) => {
       const buf = await rawBody(request);
       const update = JSON.parse(buf.toString());
       console.log('[DEBUG] Received update:', JSON.stringify(update, null, 2));
-
-      // Double check bot exists and has handleUpdate method
-      if (!bot || typeof bot.handleUpdate !== 'function') {
-        console.error('[DEBUG] Bot not properly initialized:', bot);
-        throw new Error('Bot not properly initialized');
-      }
 
       await bot.handleUpdate(update);
       console.log('[DEBUG] Update handled successfully');
@@ -180,27 +279,39 @@ const handler = async (request, response) => {
   }
 };
 
+// Configure serverless function
 handler.config = {
   api: {
     bodyParser: false,
   },
 };
 
-// Immediate initialization in production
-if (process.env.VERCEL_URL && process.env.NODE_ENV === 'production') {
-  console.log(
-    '[DEBUG] Production environment detected. Starting initialization...'
-  );
+// Initialize based on environment
+if (require.main === module) {
+  // Running directly (local development)
   initializeServices()
-    .then(() => {
-      console.log('[DEBUG] Services initialized, setting up webhook...');
-      return setupWebhook(process.env.VERCEL_URL);
-    })
+    .then(() => startPolling())
+    .catch(error => {
+      console.error(
+        '[DEBUG] Failed to initialize for local development:',
+        error
+      );
+      process.exit(1);
+    });
+} else if (process.env.VERCEL_URL && process.env.NODE_ENV === 'production') {
+  // Running on Vercel production
+  console.log('[DEBUG] Production environment detected, setting up webhook...');
+  initializeServices()
+    .then(() => setupWebhook(process.env.VERCEL_URL))
     .then(success => {
-      console.log('[DEBUG] Webhook setup finished. Success:', success);
+      if (success) {
+        console.log('[DEBUG] Webhook setup complete');
+      } else {
+        console.error('[DEBUG] Webhook setup failed');
+      }
     })
     .catch(error => {
-      console.error('[DEBUG] Startup error:', error);
+      console.error('[DEBUG] Production initialization error:', error);
     });
 }
 

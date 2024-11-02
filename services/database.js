@@ -4,28 +4,70 @@ const config = require('../config/default');
 let isConnected = false;
 
 const connectToDatabase = async () => {
-  if (isConnected) {
-    return;
-  }
-
   try {
-    const mongoUri = process.env.MONGODB_URI || config.mongodb.uri;
+    console.log('[DEBUG] Starting database connection...');
 
-    if (!mongoUri) {
+    // Check if MONGODB_URI exists
+    if (!process.env.MONGODB_URI) {
+      console.error('[DEBUG] MONGODB_URI is not set in environment variables');
+      throw new Error('MONGODB_URI environment variable is not set');
+    }
+
+    console.log(
+      '[DEBUG] MONGODB_URI exists and starts with:',
+      process.env.MONGODB_URI.substring(0, 20) + '...'
+    );
+
+    // Configure mongoose
+    mongoose.set('strictQuery', false);
+
+    const mongooseOptions = {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      serverSelectionTimeoutMS: 10000, // Increase timeout to 10 seconds
+      heartbeatFrequencyMS: 2000, // Check connection more frequently
+    };
+
+    // Set up mongoose connection event handlers before connecting
+    mongoose.connection.on('connecting', () => {
+      console.log('[DEBUG] MongoDB is connecting...');
+    });
+
+    mongoose.connection.on('connected', () => {
+      console.log('[DEBUG] MongoDB connected successfully!');
+    });
+
+    mongoose.connection.on('disconnected', () => {
+      console.error('[DEBUG] MongoDB disconnected!');
+    });
+
+    mongoose.connection.on('error', err => {
+      console.error('[DEBUG] MongoDB connection error:', err);
+    });
+
+    // Attempt connection
+    console.log('[DEBUG] Attempting to connect to MongoDB...');
+    await mongoose.connect(process.env.MONGODB_URI, mongooseOptions);
+
+    // Verify connection
+    const connectionState = mongoose.connection.readyState;
+    console.log('[DEBUG] Connection state after connect:', connectionState);
+
+    if (connectionState !== 1) {
       throw new Error(
-        'MongoDB URI is not defined in environment variables or config'
+        `Failed to connect to MongoDB. Connection state: ${connectionState}`
       );
     }
 
-    await mongoose.connect(mongoUri, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    });
-
-    isConnected = true;
-    console.log('MongoDB connected successfully');
+    console.log('[DEBUG] MongoDB connection verified and ready!');
+    return true;
   } catch (error) {
-    console.error('MongoDB connection error:', error);
+    console.error('[DEBUG] Database connection error full details:', {
+      message: error.message,
+      stack: error.stack,
+      code: error.code,
+      name: error.name,
+    });
     throw error;
   }
 };
