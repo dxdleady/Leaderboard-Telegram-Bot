@@ -1,12 +1,14 @@
+// services/websocketManager.js
 const WebSocket = require('ws');
 const { EventEmitter } = require('events');
 
 class WebSocketManager extends EventEmitter {
   constructor() {
     super();
-    this.connections = new Map(); // userId -> WebSocket
-    this.messageQueues = new Map(); // userId -> Promise
-    this.processingQueues = new Map(); // userId -> boolean
+    this.connections = new Map();
+    this.messageQueues = new Map();
+    this.processing = new Map();
+    this.timeouts = new Map();
   }
 
   addConnection(userId, ws) {
@@ -22,56 +24,92 @@ class WebSocketManager extends EventEmitter {
       this.removeConnection(userId);
     });
 
-    // Send initial connection status
+    // Clear any existing timeouts for this user
+    if (this.timeouts.has(userId)) {
+      clearTimeout(this.timeouts.get(userId));
+      this.timeouts.delete(userId);
+    }
+
     ws.send(JSON.stringify({ type: 'connection', status: 'connected' }));
   }
 
   removeConnection(userId) {
-    const ws = this.connections.get(userId);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.close();
+    if (this.connections.has(userId)) {
+      const ws = this.connections.get(userId);
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
+      this.connections.delete(userId);
     }
-    this.connections.delete(userId);
+
+    // Clear all state for this user
     this.messageQueues.delete(userId);
-    this.processingQueues.delete(userId);
-    console.log(`WebSocket connection removed for user ${userId}`);
+    this.processing.delete(userId);
+    if (this.timeouts.has(userId)) {
+      clearTimeout(this.timeouts.get(userId));
+      this.timeouts.delete(userId);
+    }
   }
 
   initializeQueue(userId) {
     if (!this.messageQueues.has(userId)) {
       this.messageQueues.set(userId, Promise.resolve());
-      this.processingQueues.set(userId, false);
+      this.processing.set(userId, false);
+    }
+  }
+
+  async processNextMessage(userId) {
+    if (this.processing.get(userId)) return;
+
+    const queue = this.messageQueues.get(userId);
+    if (!queue) return;
+
+    this.processing.set(userId, true);
+
+    try {
+      await queue;
+    } catch (error) {
+      console.error(`Error processing message for user ${userId}:`, error);
+    } finally {
+      this.processing.set(userId, false);
+
+      // Schedule next message processing
+      this.timeouts.set(
+        userId,
+        setTimeout(() => {
+          if (this.messageQueues.has(userId)) {
+            this.processNextMessage(userId);
+          }
+        }, 500)
+      );
     }
   }
 
   async queueMessage(userId, action) {
     this.initializeQueue(userId);
 
-    const queue = this.messageQueues.get(userId);
-    const newPromise = queue.then(async () => {
-      if (this.processingQueues.get(userId)) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-
-      this.processingQueues.set(userId, true);
+    const newPromise = this.messageQueues.get(userId).then(async () => {
       try {
         await action();
-        await new Promise(resolve => setTimeout(resolve, 500));
       } catch (error) {
-        console.error('Error in queued message:', error);
+        console.error(`Error in queued message for user ${userId}:`, error);
         throw error;
-      } finally {
-        this.processingQueues.set(userId, false);
       }
     });
 
     this.messageQueues.set(userId, newPromise);
+    this.processNextMessage(userId);
+
     return newPromise;
   }
 
   clearQueue(userId) {
     this.messageQueues.set(userId, Promise.resolve());
-    this.processingQueues.set(userId, false);
+    this.processing.set(userId, false);
+    if (this.timeouts.has(userId)) {
+      clearTimeout(this.timeouts.get(userId));
+      this.timeouts.delete(userId);
+    }
   }
 
   isConnected(userId) {
@@ -81,18 +119,13 @@ class WebSocketManager extends EventEmitter {
     );
   }
 
-  broadcast(message) {
-    for (const [userId, ws] of this.connections.entries()) {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(message));
-      }
-    }
-  }
-
   sendToUser(userId, message) {
-    const ws = this.connections.get(userId);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(message));
+    if (this.isConnected(userId)) {
+      try {
+        this.connections.get(userId).send(JSON.stringify(message));
+      } catch (error) {
+        console.error(`Error sending message to user ${userId}:`, error);
+      }
     }
   }
 

@@ -27,7 +27,8 @@ async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
   const quiz = quizzes[quizId];
   const questionData = quiz.questions[questionIndex];
 
-  await wsManager.queueMessage(userId, async () => {
+  // Create a promise that resolves when the message is sent
+  const sendMessagePromise = new Promise(async (resolve, reject) => {
     try {
       if (!quiz || !questionData) {
         await bot.telegram.sendMessage(
@@ -37,7 +38,7 @@ async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
             protect_content: true,
           }
         );
-        return;
+        return resolve();
       }
 
       if (userSession.lastMessageId) {
@@ -67,7 +68,6 @@ async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
       userSession.currentQuizId = quizId;
       userSession.currentQuestionIndex = questionIndex;
 
-      // Notify through WebSocket
       if (wsManager.isConnected(userId)) {
         wsManager.sendToUser(userId, {
           type: 'quiz_progress',
@@ -75,6 +75,8 @@ async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
           totalQuestions: quiz.questions.length,
         });
       }
+
+      resolve();
     } catch (error) {
       console.error('Error sending quiz question:', error);
       wsManager.clearQueue(userId);
@@ -83,12 +85,15 @@ async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
         'Error sending quiz question. Please try /start to begin again.',
         { protect_content: true }
       );
+      reject(error);
     }
   });
+
+  // Queue the message sending
+  await wsManager.queueMessage(userId, () => sendMessagePromise);
 }
 
 const setupActionHandlers = bot => {
-  // Quiz start action
   bot.action(/^start_quiz_(\d+)$/, async ctx => {
     try {
       const quizId = ctx.match[1];
@@ -101,6 +106,7 @@ const setupActionHandlers = bot => {
       }
 
       await ctx.deleteMessage().catch(console.error);
+      wsManager.clearQueue(userId); // Clear any existing queue
 
       const quiz = quizzes[quizId];
       if (!quiz) {
@@ -110,6 +116,7 @@ const setupActionHandlers = bot => {
         return;
       }
 
+      // Queue the start message
       await wsManager.queueMessage(userId, async () => {
         await ctx.reply(`Starting quiz: ${quiz.title}`, {
           protect_content: true,
@@ -124,7 +131,10 @@ const setupActionHandlers = bot => {
         }
       });
 
+      // Wait a bit before sending the first question
       await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Send first question
       await sendQuizQuestion(bot, chatId, quizId, 0, userId);
       await ctx.answerCbQuery();
     } catch (error) {
