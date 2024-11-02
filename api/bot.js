@@ -13,28 +13,36 @@ let bot = null;
 const initBot = () => {
   console.log('[DEBUG] Starting bot initialization...');
   console.log('[DEBUG] BOT_TOKEN exists:', !!process.env.BOT_TOKEN);
-  console.log('[DEBUG] VERCEL_URL:', process.env.VERCEL_URL);
-  console.log('[DEBUG] NODE_ENV:', process.env.NODE_ENV);
 
   if (!process.env.BOT_TOKEN) {
     throw new Error('BOT_TOKEN environment variable is not set');
   }
 
-  const newBot = new Telegraf(process.env.BOT_TOKEN, {
-    handlerTimeout: 90000,
-  });
+  try {
+    const newBot = new Telegraf(process.env.BOT_TOKEN, {
+      handlerTimeout: 90000,
+    });
 
-  newBot.catch(async (err, ctx) => {
-    console.error('[DEBUG] Bot error:', err);
-    try {
-      await ctx.reply('An error occurred. Please try again later.');
-    } catch (replyError) {
-      console.error('[DEBUG] Error sending error message:', replyError);
+    // Verify bot was created properly
+    if (!newBot || typeof newBot.handleUpdate !== 'function') {
+      throw new Error('Bot not properly initialized by Telegraf');
     }
-  });
 
-  console.log('[DEBUG] Bot instance created successfully');
-  return newBot;
+    newBot.catch(async (err, ctx) => {
+      console.error('[DEBUG] Bot error:', err);
+      try {
+        await ctx.reply('An error occurred. Please try again later.');
+      } catch (replyError) {
+        console.error('[DEBUG] Error sending error message:', replyError);
+      }
+    });
+
+    console.log('[DEBUG] Bot instance created successfully');
+    return newBot;
+  } catch (error) {
+    console.error('[DEBUG] Error in bot initialization:', error);
+    throw error;
+  }
 };
 
 const setupWebhook = async domain => {
@@ -134,25 +142,41 @@ const handler = async (request, response) => {
     if (request.method === 'POST') {
       console.log('[DEBUG] Received webhook POST');
 
+      // Initialize services before handling update
+      const initialized = await initializeServices();
+      console.log('[DEBUG] Services initialized:', initialized);
+
       if (!bot) {
-        console.log(
-          '[DEBUG] Bot not initialized during POST. Initializing services...'
-        );
-        await initializeServices();
+        console.error('[DEBUG] Bot still null after initialization!');
+        throw new Error('Failed to initialize bot');
       }
 
       const buf = await rawBody(request);
       const update = JSON.parse(buf.toString());
       console.log('[DEBUG] Received update:', JSON.stringify(update, null, 2));
 
+      // Double check bot exists and has handleUpdate method
+      if (!bot || typeof bot.handleUpdate !== 'function') {
+        console.error('[DEBUG] Bot not properly initialized:', bot);
+        throw new Error('Bot not properly initialized');
+      }
+
       await bot.handleUpdate(update);
+      console.log('[DEBUG] Update handled successfully');
       return response.status(200).json({ ok: true });
     }
 
     return response.status(405).json({ error: 'Method not allowed' });
   } catch (error) {
     console.error('[DEBUG] Handler error:', error);
-    return response.status(200).json({ ok: true });
+    console.error('[DEBUG] Bot state:', !!bot);
+    return response.status(200).json({
+      ok: true,
+      error:
+        process.env.NODE_ENV === 'development'
+          ? error.message
+          : 'Internal server error',
+    });
   }
 };
 
