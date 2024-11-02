@@ -10,6 +10,7 @@ const {
   connectToDatabase,
   initializeDatabase,
   clearDatabase,
+  resetUserProgress,
 } = require('../services/database');
 const setupCommandHandlers = require('../handlers/commandHandlers');
 const { setupActionHandlers } = require('../handlers/actionHandlers');
@@ -25,33 +26,42 @@ const setupWebSocketServer = server => {
   });
 
   wss.on('connection', (ws, request) => {
-    // Extract user ID from URL parameters
-    const url = new URL(request.url, `http://${request.headers.host}`);
-    const userId = parseInt(url.searchParams.get('userId'));
+    try {
+      const url = new URL(request.url, `http://${request.headers.host}`);
+      const userId = parseInt(url.searchParams.get('userId'));
 
-    if (!userId) {
-      console.error('WebSocket connection attempt without userId');
-      ws.close(1008, 'UserId is required');
-      return;
-    }
+      if (!userId) {
+        console.error('WebSocket connection attempt without userId');
+        ws.close(1008, 'UserId is required');
+        return;
+      }
 
-    ws.isAlive = true;
-    ws.userId = userId;
+      // Close existing connection if any
+      if (wsManager.isConnected(userId)) {
+        wsManager.removeConnection(userId);
+      }
 
-    wsManager.addConnection(userId, ws);
-
-    ws.on('pong', () => {
       ws.isAlive = true;
-    });
+      ws.userId = userId;
 
-    ws.on('close', () => {
-      wsManager.removeConnection(userId);
-    });
+      wsManager.addConnection(userId, ws);
 
-    ws.on('error', error => {
-      console.error(`WebSocket error for user ${userId}:`, error);
-      wsManager.removeConnection(userId);
-    });
+      ws.on('pong', () => {
+        ws.isAlive = true;
+      });
+
+      ws.on('close', () => {
+        wsManager.removeConnection(userId);
+      });
+
+      ws.on('error', error => {
+        console.error(`WebSocket error for user ${userId}:`, error);
+        wsManager.removeConnection(userId);
+      });
+    } catch (error) {
+      console.error('Error handling WebSocket connection:', error);
+      ws.close(1011, 'Internal Server Error');
+    }
   });
 
   // Setup heartbeat interval
@@ -73,14 +83,78 @@ const setupWebSocketServer = server => {
   return wss;
 };
 
+const startupCleanup = async () => {
+  try {
+    console.log('Starting cleanup process...');
+
+    // Clear database
+    await clearDatabase();
+
+    // Initialize fresh database
+    await initializeDatabase();
+
+    // Clear any existing sessions
+    global.userSessions = new Map();
+
+    // Clear WebSocket connections
+    wsManager.getActiveConnections().forEach(userId => {
+      wsManager.removeConnection(userId);
+    });
+
+    console.log('Cleanup completed successfully');
+  } catch (error) {
+    console.error('Error during cleanup:', error);
+    throw error;
+  }
+};
+
+const setupAdditionalCommands = bot => {
+  // Reset command for development and admin use
+  bot.command('reset', async ctx => {
+    try {
+      if (
+        process.env.NODE_ENV === 'development' ||
+        config.bot.adminIds.includes(ctx.from.id)
+      ) {
+        await resetUserProgress(ctx.from.id);
+        await ctx.reply(
+          'Your quiz progress has been reset. You can start fresh now!'
+        );
+      } else {
+        await ctx.reply('This command is only available for administrators.');
+      }
+    } catch (error) {
+      console.error('Error in reset command:', error);
+      await ctx.reply('Error resetting progress. Please try again later.');
+    }
+  });
+
+  // Debug command for development
+  if (process.env.NODE_ENV === 'development') {
+    bot.command('debug', async ctx => {
+      try {
+        const debugInfo = {
+          wsConnections: wsManager.getActiveConnections().length,
+          dbStatus: mongoose.connection.readyState,
+          sessionCount: global.userSessions?.size || 0,
+        };
+        await ctx.reply(`Debug info:\n${JSON.stringify(debugInfo, null, 2)}`);
+      } catch (error) {
+        console.error('Error in debug command:', error);
+      }
+    });
+  }
+};
+
 const initializeBot = async (server = null) => {
   try {
     if (!bot) {
       bot = new Telegraf(config.bot.token);
 
-      // Setup handlers
+      // Setup all handlers
       setupCommandHandlers(bot);
       setupActionHandlers(bot);
+      setupAdditionalCommands(bot);
 
       if (process.env.NODE_ENV === 'production') {
         const domain = process.env.VERCEL_URL || process.env.DOMAIN;
@@ -93,14 +167,12 @@ const initializeBot = async (server = null) => {
         const webhookUrl = `https://${domain}/api/bot`;
         console.log('Setting webhook URL:', webhookUrl);
 
-        // Setup WebSocket server if server instance is provided
         if (server) {
           wss = setupWebSocketServer(server);
           console.log('WebSocket server initialized');
         }
 
         try {
-          // Delete existing webhook before setting new one
           await bot.telegram.deleteWebhook();
           await bot.telegram.setWebhook(webhookUrl);
 
@@ -111,18 +183,15 @@ const initializeBot = async (server = null) => {
           throw error;
         }
       } else {
-        // Development mode - use polling
         console.log('Starting bot in polling mode...');
         await bot.launch();
         console.log('Bot launched successfully in polling mode');
       }
 
-      // Handle errors
       bot.catch(error => {
         console.error('Bot error:', error);
       });
 
-      // Graceful shutdown
       process.once('SIGINT', () => cleanup());
       process.once('SIGTERM', () => cleanup());
     }
@@ -137,38 +206,38 @@ const initializeBot = async (server = null) => {
 const cleanup = async () => {
   console.log('Performing cleanup...');
 
-  if (bot) {
-    console.log('Stopping bot...');
-    await bot.stop('SIGTERM');
-  }
+  try {
+    if (bot) {
+      console.log('Stopping bot...');
+      await bot.stop('SIGTERM');
+    }
 
-  if (wss) {
-    console.log('Closing WebSocket server...');
-    wss.close(() => {
+    if (wss) {
+      console.log('Closing WebSocket server...');
+      await new Promise(resolve => wss.close(resolve));
       console.log('WebSocket server closed');
+    }
+
+    wsManager.getActiveConnections().forEach(userId => {
+      wsManager.removeConnection(userId);
     });
+
+    if (mongoose.connection.readyState === 1) {
+      console.log('Closing database connection...');
+      await mongoose.connection.close();
+    }
+
+    console.log('Cleanup completed successfully');
+  } catch (error) {
+    console.error('Error during cleanup:', error);
+    process.exit(1);
   }
-
-  // Close all active WebSocket connections
-  wsManager.getActiveConnections().forEach(userId => {
-    wsManager.removeConnection(userId);
-  });
-
-  // Close database connection
-  if (mongoose.connection.readyState === 1) {
-    console.log('Closing database connection...');
-    await mongoose.connection.close();
-  }
-
-  console.log('Cleanup completed');
 };
 
-// API handler function
 const handler = async (req, res) => {
   try {
     await connectToDatabase();
 
-    // Handle WebSocket upgrade requests
     if (req.headers.upgrade?.toLowerCase() === 'websocket') {
       if (!wss) {
         wss = setupWebSocketServer(req.socket.server);
@@ -179,29 +248,23 @@ const handler = async (req, res) => {
       return;
     }
 
-    // Initialize bot if needed
     if (!bot) {
       bot = await initializeBot(req.socket?.server);
     }
 
-    // Handle webhook requests
     await webhookHandler(req, res, bot);
   } catch (error) {
     console.error('Error in API handler:', error);
-    // Always return 200 to Telegram
     res.status(200).json({ ok: true });
   }
 };
 
-// Development mode startup
+// Development mode startup with cleanup support
 if (process.env.NODE_ENV !== 'production') {
   connectToDatabase()
     .then(async () => {
       if (process.argv.includes('cleanup')) {
-        console.log('Cleaning database...');
-        await clearDatabase();
-        await initializeDatabase();
-        console.log('Database reinitialized with fresh data.');
+        await startupCleanup();
       }
       return initializeBot();
     })
@@ -211,7 +274,6 @@ if (process.env.NODE_ENV !== 'production') {
     });
 }
 
-// Configuration for the API route
 handler.config = {
   api: {
     bodyParser: false,

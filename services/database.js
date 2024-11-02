@@ -36,9 +36,47 @@ const clearDatabase = async () => {
     await connectToDatabase();
   }
 
-  const collections = mongoose.connection.collections;
-  for (const key in collections) {
-    await collections[key].deleteMany();
+  try {
+    console.log('Starting database cleanup...');
+
+    // List of collections to clean
+    const collectionsToClean = [
+      'userQuiz',
+      'sessions',
+      'users',
+      'quizProgress',
+    ];
+
+    // Drop each collection
+    for (const collectionName of collectionsToClean) {
+      try {
+        const collection = mongoose.connection.collection(collectionName);
+        if (collection) {
+          await collection.drop();
+          console.log(`Dropped collection: ${collectionName}`);
+        }
+      } catch (error) {
+        if (error.code !== 26) {
+          // Ignore "namespace not found" errors
+          console.error(`Error dropping collection ${collectionName}:`, error);
+        }
+      }
+    }
+
+    // Clear all documents from any remaining collections
+    const collections = await mongoose.connection.db.collections();
+    for (const collection of collections) {
+      await collection.deleteMany({});
+      console.log(`Cleared collection: ${collection.collectionName}`);
+    }
+
+    // Reset sessions
+    global.userSessions = new Map();
+
+    console.log('Database cleanup completed successfully');
+  } catch (error) {
+    console.error('Error during database cleanup:', error);
+    throw error;
   }
 };
 
@@ -46,116 +84,67 @@ const initializeDatabase = async () => {
   if (!isConnected) {
     await connectToDatabase();
   }
+
+  try {
+    console.log('Initializing database with fresh state...');
+
+    // Create necessary collections
+    const db = mongoose.connection.db;
+    await db.createCollection('userQuiz');
+    await db.createCollection('sessions');
+
+    // Initialize any default data if needed
+
+    console.log('Database initialized successfully');
+  } catch (error) {
+    console.error('Error initializing database:', error);
+    throw error;
+  }
 };
 
 const hasUserCompletedQuiz = async (userId, quizId = null) => {
   try {
-    const userQuizCollection = mongoose.connection.collection('userQuiz');
-
-    // If quizId is provided, check specific quiz completion
-    if (quizId) {
-      const userQuiz = await userQuizCollection.findOne({
-        userId: parseInt(userId),
-        quizId: parseInt(quizId),
-        completed: true,
-      });
-      return !!userQuiz;
+    if (!isConnected) {
+      await connectToDatabase();
     }
 
-    // Otherwise check if user has any completed quizzes
-    const completedQuizzes = await userQuizCollection
-      .find({
-        userId: parseInt(userId),
-        completed: true,
-      })
-      .toArray();
+    const userQuizCollection = mongoose.connection.collection('userQuiz');
+    const query = {
+      userId: parseInt(userId),
+      completed: true,
+    };
 
-    return completedQuizzes.length > 0;
+    if (quizId !== null) {
+      query.quizId = parseInt(quizId);
+    }
+
+    const completedQuiz = await userQuizCollection.findOne(query);
+    return !!completedQuiz;
   } catch (error) {
     console.error('Error checking quiz completion:', error);
     return false;
   }
 };
 
-const getUserQuizScore = async (userId, quizId) => {
+const resetUserProgress = async userId => {
   try {
-    const userQuizCollection = mongoose.connection.collection('userQuiz');
-    const userQuiz = await userQuizCollection.findOne({
-      userId: parseInt(userId),
-      quizId: parseInt(quizId),
-    });
-    return userQuiz?.score || 0;
-  } catch (error) {
-    console.error('Error getting quiz score:', error);
-    return 0;
-  }
-};
+    if (!isConnected) {
+      await connectToDatabase();
+    }
 
-const updateUserQuizScore = async (userId, quizId, score, username) => {
-  try {
     const userQuizCollection = mongoose.connection.collection('userQuiz');
-    await userQuizCollection.updateOne(
-      {
-        userId: parseInt(userId),
-        quizId: parseInt(quizId),
-      },
-      {
-        $set: {
-          score,
-          username,
-          lastUpdated: new Date(),
-        },
-      },
-      { upsert: true }
-    );
-  } catch (error) {
-    console.error('Error updating quiz score:', error);
-    throw error;
-  }
-};
+    await userQuizCollection.deleteMany({ userId: parseInt(userId) });
 
-const markQuizAsCompleted = async (userId, quizId) => {
-  try {
-    const userQuizCollection = mongoose.connection.collection('userQuiz');
-    await userQuizCollection.updateOne(
-      {
-        userId: parseInt(userId),
-        quizId: parseInt(quizId),
-      },
-      {
-        $set: {
-          completed: true,
-          completedAt: new Date(),
-        },
-      },
-      { upsert: true }
-    );
-  } catch (error) {
-    console.error('Error marking quiz as completed:', error);
-    throw error;
-  }
-};
+    // Clear user session if exists
+    if (global.userSessions && global.userSessions.has(userId)) {
+      global.userSessions.delete(userId);
+    }
 
-const getLeaderboard = async (limit = 10) => {
-  try {
-    const userQuizCollection = mongoose.connection.collection('userQuiz');
-    return await userQuizCollection
-      .aggregate([
-        {
-          $group: {
-            _id: '$userId',
-            totalScore: { $sum: '$score' },
-            username: { $first: '$username' },
-            completedQuizzes: { $sum: { $cond: ['$completed', 1, 0] } },
-          },
-        },
-        { $sort: { totalScore: -1 } },
-        { $limit: limit },
-      ])
-      .toArray();
+    console.log(`Reset progress for user: ${userId}`);
+    return true;
   } catch (error) {
-    console.error('Error getting leaderboard:', error);
-    return [];
+    console.error('Error resetting user progress:', error);
+    return false;
   }
 };
 
