@@ -22,11 +22,11 @@ const safeDeleteMessage = async (bot, chatId, messageId) => {
 };
 
 async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
-  const quiz = quizzes[quizId];
-  const questionData = quiz.questions[questionIndex];
-  const userSession = getUserSession(userId);
+  try {
+    const userSession = getUserSession(userId);
+    const quiz = quizzes[quizId];
+    const questionData = quiz.questions[questionIndex];
 
-  const sendQuestion = async () => {
     if (!quiz || !questionData) {
       await bot.telegram.sendMessage(
         chatId,
@@ -67,18 +67,25 @@ async function sendQuizQuestion(bot, chatId, quizId, questionIndex, userId) {
     userSession.currentQuestionIndex = questionIndex;
 
     if (wsManager.isConnected(userId)) {
-      wsManager.sendToUser(userId, {
-        type: 'quiz_progress',
-        currentQuestion: questionIndex + 1,
+      wsManager.updateQuizProgress(userId, {
+        questionIndex: questionIndex + 1,
         totalQuestions: quiz.questions.length,
+        quizId,
+        quizTitle: quiz.title,
       });
     }
-  };
-
-  await wsManager.queueMessage(userId, sendQuestion);
+  } catch (error) {
+    console.error('Error sending quiz question:', error);
+    await bot.telegram.sendMessage(
+      chatId,
+      'Error sending quiz question. Please try /start to begin again.',
+      { protect_content: true }
+    );
+  }
 }
 
 const setupActionHandlers = bot => {
+  // Quiz start action
   bot.action(/^start_quiz_(\d+)$/, async ctx => {
     try {
       const quizId = ctx.match[1];
@@ -90,9 +97,6 @@ const setupActionHandlers = bot => {
         return;
       }
 
-      wsManager.clearQueue(userId);
-      await ctx.deleteMessage().catch(console.error);
-
       const quiz = quizzes[quizId];
       if (!quiz) {
         await ctx.reply('Sorry, this quiz is no longer available.', {
@@ -101,18 +105,13 @@ const setupActionHandlers = bot => {
         return;
       }
 
-      // Send start message
-      await wsManager.queueMessage(userId, async () => {
-        await ctx.reply(`Starting quiz: ${quiz.title}`, {
-          protect_content: true,
-        });
-      });
+      // Only delete the button message, not the entire chat history
+      await ctx
+        .deleteMessage(ctx.callbackQuery.message.message_id)
+        .catch(console.error);
 
-      // Send first question after a delay
-      await wsManager.queueMessage(userId, async () => {
-        await sendQuizQuestion(bot, chatId, quizId, 0, userId);
-      });
-
+      // Start the quiz without repeating the welcome message
+      await sendQuizQuestion(bot, chatId, quizId, 0, userId);
       await ctx.answerCbQuery();
     } catch (error) {
       console.error('Error handling start quiz button:', error);
@@ -120,58 +119,66 @@ const setupActionHandlers = bot => {
     }
   });
 
+  // Quiz answer action
   bot.action(/q(\d+)_(\d+)_(\d+)_(\d+)/, async ctx => {
     try {
-      const [_, quizId, questionIndex, answerIndex, userId] = ctx.match;
+      const [_, quizId, questionIndex, answerIndex, userId] =
+        ctx.match.map(Number);
       const chatId = ctx.chat.id;
 
-      if (parseInt(userId) !== ctx.from.id) {
+      if (userId !== ctx.from.id) {
         await ctx.answerCbQuery('This is not your quiz question!');
         return;
       }
 
-      wsManager.clearQueue(userId);
-      await ctx.deleteMessage().catch(console.error);
+      // Delete only the question message
+      await ctx
+        .deleteMessage(ctx.callbackQuery.message.message_id)
+        .catch(console.error);
 
       const quiz = quizzes[quizId];
       const questionData = quiz.questions[questionIndex];
       const userAnswer = questionData.options[answerIndex];
       const userQuizCollection = mongoose.connection.collection('userQuiz');
 
-      // Handle answer
-      await wsManager.queueMessage(userId, async () => {
-        if (userAnswer === questionData.correct) {
-          const msg = await ctx.reply(
-            `✅ Correct answer! 🎉\n\n🔗 Read full article: ${questionData.link}`,
-            { protect_content: true }
-          );
+      const isCorrect = userAnswer === questionData.correct;
 
-          await userQuizCollection.updateOne(
-            { userId: parseInt(userId), quizId: parseInt(quizId) },
-            { $inc: { score: 1 }, $set: { username: ctx.from.username } },
-            { upsert: true }
-          );
+      // Show answer result
+      const resultMsg = await ctx.reply(
+        isCorrect
+          ? `✅ Correct answer! 🎉\n\n🔗 Read full article: ${questionData.link}`
+          : `❌ Wrong answer!\nThe correct answer was: ${questionData.correct}\n\n🔗 Read full article: ${questionData.link}`,
+        { protect_content: true }
+      );
 
-          setTimeout(
-            () => safeDeleteMessage(bot, chatId, msg.message_id),
-            2000
-          );
-        } else {
-          const msg = await ctx.reply(
-            `❌ Wrong answer!\nThe correct answer was: ${questionData.correct}\n\n🔗 Read full article: ${questionData.link}`,
-            { protect_content: true }
-          );
+      if (isCorrect) {
+        await userQuizCollection.updateOne(
+          { userId, quizId },
+          { $inc: { score: 1 }, $set: { username: ctx.from.username } },
+          { upsert: true }
+        );
+      }
 
-          setTimeout(
-            () => safeDeleteMessage(bot, chatId, msg.message_id),
-            2000
-          );
-        }
-      });
+      // Delete result message after delay
+      setTimeout(
+        () => safeDeleteMessage(bot, chatId, resultMsg.message_id),
+        2000
+      );
 
-      // Send next question or completion message
-      await wsManager.queueMessage(userId, async () => {
-        const nextQuestionIndex = parseInt(questionIndex) + 1;
+      // Notify WebSocket if connected
+      if (wsManager.isConnected(userId)) {
+        wsManager.sendToUser(userId, {
+          type: 'answer_result',
+          correct: isCorrect,
+          questionIndex: questionIndex + 1,
+          totalQuestions: quiz.questions.length,
+          correctAnswer: questionData.correct,
+        });
+      }
+
+      // Process next question or quiz completion after delay
+      setTimeout(async () => {
+        const nextQuestionIndex = questionIndex + 1;
         if (nextQuestionIndex < quiz.questions.length) {
           await sendQuizQuestion(
             bot,
@@ -181,12 +188,7 @@ const setupActionHandlers = bot => {
             userId
           );
         } else {
-          // Handle quiz completion
-          const userQuiz = await userQuizCollection.findOne({
-            userId: parseInt(userId),
-            quizId: parseInt(quizId),
-          });
-
+          const userQuiz = await userQuizCollection.findOne({ userId, quizId });
           const totalQuestions = quiz.questions.length;
           const userScore = userQuiz?.score || 0;
           const scorePercentage = Math.round(
@@ -214,16 +216,26 @@ const setupActionHandlers = bot => {
           });
 
           await userQuizCollection.updateOne(
-            { userId: parseInt(userId), quizId: parseInt(quizId) },
+            { userId, quizId },
             { $set: { completed: true } },
             { upsert: true }
           );
+
+          if (wsManager.isConnected(userId)) {
+            wsManager.sendToUser(userId, {
+              type: 'quiz_completed',
+              score: userScore,
+              totalQuestions,
+              scorePercentage,
+              isPerfectScore: scorePercentage === 100,
+            });
+          }
         }
-      });
+      }, 2500);
 
       await ctx.answerCbQuery();
     } catch (error) {
-      wsManager.clearQueue(userId);
+      console.error('Error handling answer:', error);
       await ctx.reply(
         'Sorry, there was an error. Please try /start to begin again.'
       );
