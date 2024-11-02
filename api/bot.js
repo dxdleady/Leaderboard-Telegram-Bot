@@ -109,67 +109,106 @@ const setupWebSocket = server => {
   return wss;
 };
 
+// Serverless function handler
 const handler = async (req, res) => {
+  // Log request details for debugging
+  console.log('Request received:', {
+    method: req.method,
+    url: req.url,
+    headers: req.headers,
+  });
+
   try {
-    // Handle WebSocket upgrade requests
-    if (req.headers.upgrade?.toLowerCase() === 'websocket') {
-      if (!res.socket.server.ws) {
-        res.socket.server.ws = setupWebSocket(res.socket.server);
-      }
-
-      res.socket.server.ws.handleUpgrade(
-        req,
-        req.socket,
-        Buffer.alloc(0),
-        ws => {
-          res.socket.server.ws.emit('connection', ws, req);
-        }
-      );
-      return;
-    }
-
-    // Connect to database for HTTP requests
-    await connectToDatabase();
-
-    // Handle health check
+    // Health check endpoint
     if (req.method === 'GET') {
-      const health = await getHealthStatus();
-      return res.status(200).json(health);
+      // Get webhook info for health check
+      try {
+        const webhookInfo = await bot.telegram.getWebhookInfo();
+        return res.status(200).json({
+          ok: true,
+          timestamp: new Date().toISOString(),
+          webhook: webhookInfo,
+        });
+      } catch (error) {
+        console.error('Error getting webhook info:', error);
+        return res.status(200).json({
+          ok: true,
+          error: error.message,
+        });
+      }
     }
 
     // Handle webhook updates
     if (req.method === 'POST') {
-      let update;
-      try {
-        const rawReqBody = await rawBody(req);
-        update = JSON.parse(rawReqBody.toString());
-      } catch (error) {
-        console.error('Error parsing webhook body:', error);
-        return res.status(200).json({ ok: true }); // Return 200 even for parsing errors
-      }
+      console.log('Received POST request');
 
-      try {
-        await Promise.race([
-          bot.handleUpdate(update),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Update timeout')), 8000)
-          ),
-        ]);
+      // Get the raw body
+      const buf = await rawBody(req);
+      console.log('Raw body received:', buf.toString());
 
-        return res.status(200).json({ ok: true });
+      // Parse update
+      const update = JSON.parse(buf.toString());
+      console.log('Update parsed:', update);
+
+      // Process update
+      try {
+        await bot.handleUpdate(update);
+        console.log('Update processed successfully');
       } catch (error) {
         console.error('Error processing update:', error);
-        return res.status(200).json({ ok: true }); // Always return 200 for webhook
       }
+
+      // Always return success to Telegram
+      return res.status(200).json({ ok: true });
     }
 
+    // Handle unsupported methods
     return res.status(405).json({ error: 'Method not allowed' });
   } catch (error) {
     console.error('Handler error:', error);
-    // Always return 200 for webhook requests to prevent Telegram retries
-    return res.status(200).json({ ok: true, error: error.message });
+    // Always return 200 to Telegram even on error
+    return res.status(200).json({ ok: true });
   }
 };
+
+// Configure serverless function
+handler.config = {
+  api: {
+    bodyParser: false,
+  },
+};
+
+// Setup webhook function
+const setupWebhook = async domain => {
+  try {
+    console.log('Setting up webhook for domain:', domain);
+    const webhookUrl = `https://${domain}/api/bot`;
+
+    // Remove existing webhook
+    console.log('Removing existing webhook...');
+    await bot.telegram.deleteWebhook();
+
+    // Set new webhook
+    console.log('Setting new webhook to:', webhookUrl);
+    const success = await bot.telegram.setWebhook(webhookUrl);
+
+    if (success) {
+      console.log('Webhook set successfully');
+      const webhookInfo = await bot.telegram.getWebhookInfo();
+      console.log('Webhook info:', webhookInfo);
+    } else {
+      console.error('Failed to set webhook');
+    }
+  } catch (error) {
+    console.error('Error setting webhook:', error);
+  }
+};
+
+// Auto-setup webhook if running on Vercel
+if (process.env.VERCEL_URL) {
+  console.log('Vercel environment detected, setting up webhook...');
+  setupWebhook(process.env.VERCEL_URL).catch(console.error);
+}
 
 const getHealthStatus = async () => {
   try {
