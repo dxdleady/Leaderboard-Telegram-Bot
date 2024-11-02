@@ -1,83 +1,171 @@
+// services/database.js
 const mongoose = require('mongoose');
 const config = require('../config/default');
 
 let isConnected = false;
 
 const connectToDatabase = async () => {
-  console.log('Connecting to MongoDB...');
+  if (isConnected) {
+    return;
+  }
+
   try {
-    if (!isConnected) {
-      await mongoose.connect(config.mongodb.uri, {
-        useNewUrlParser: true,
-        useUnifiedTopology: true,
-      });
-      isConnected = true;
-      console.log('Connected to MongoDB');
-      await initializeDatabase();
+    const mongoUri = process.env.MONGODB_URI || config.mongodb.uri;
+
+    if (!mongoUri) {
+      throw new Error(
+        'MongoDB URI is not defined in environment variables or config'
+      );
     }
+
+    await mongoose.connect(mongoUri, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+    });
+
+    isConnected = true;
+    console.log('MongoDB connected successfully');
   } catch (error) {
     console.error('MongoDB connection error:', error);
-    throw error; // Rethrow to handle in calling code
-  }
-};
-
-const initializeDatabase = async () => {
-  console.log('Checking if collections are initialized...');
-
-  try {
-    const userQuizCollection = mongoose.connection.collection('userQuiz');
-
-    // Check if the collection exists
-    const count = await userQuizCollection.countDocuments();
-    if (count === 0) {
-      console.log('Initializing userQuiz collection...');
-
-      // Create indexes if needed (optional but recommended)
-      await userQuizCollection.createIndex(
-        { userId: 1, quizId: 1 },
-        { unique: true }
-      );
-
-      console.log('userQuiz collection initialized.');
-    } else {
-      console.log('userQuiz collection already exists.');
-    }
-  } catch (error) {
-    console.error('Error initializing database:', error);
     throw error;
   }
 };
 
 const clearDatabase = async () => {
+  if (!isConnected) {
+    await connectToDatabase();
+  }
+
+  const collections = mongoose.connection.collections;
+  for (const key in collections) {
+    await collections[key].deleteMany();
+  }
+};
+
+const initializeDatabase = async () => {
+  if (!isConnected) {
+    await connectToDatabase();
+  }
+};
+
+const hasUserCompletedQuiz = async (userId, quizId = null) => {
   try {
     const userQuizCollection = mongoose.connection.collection('userQuiz');
-    const result = await userQuizCollection.deleteMany({});
-    console.log(`Cleaned ${result.deletedCount} records from the database.`);
-    return result.deletedCount;
+
+    // If quizId is provided, check specific quiz completion
+    if (quizId) {
+      const userQuiz = await userQuizCollection.findOne({
+        userId: parseInt(userId),
+        quizId: parseInt(quizId),
+        completed: true,
+      });
+      return !!userQuiz;
+    }
+
+    // Otherwise check if user has any completed quizzes
+    const completedQuizzes = await userQuizCollection
+      .find({
+        userId: parseInt(userId),
+        completed: true,
+      })
+      .toArray();
+
+    return completedQuizzes.length > 0;
   } catch (error) {
-    console.error('Error clearing database:', error);
+    console.error('Error checking quiz completion:', error);
+    return false;
+  }
+};
+
+const getUserQuizScore = async (userId, quizId) => {
+  try {
+    const userQuizCollection = mongoose.connection.collection('userQuiz');
+    const userQuiz = await userQuizCollection.findOne({
+      userId: parseInt(userId),
+      quizId: parseInt(quizId),
+    });
+    return userQuiz?.score || 0;
+  } catch (error) {
+    console.error('Error getting quiz score:', error);
+    return 0;
+  }
+};
+
+const updateUserQuizScore = async (userId, quizId, score, username) => {
+  try {
+    const userQuizCollection = mongoose.connection.collection('userQuiz');
+    await userQuizCollection.updateOne(
+      {
+        userId: parseInt(userId),
+        quizId: parseInt(quizId),
+      },
+      {
+        $set: {
+          score,
+          username,
+          lastUpdated: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+  } catch (error) {
+    console.error('Error updating quiz score:', error);
     throw error;
   }
 };
 
-const hasUserCompletedQuiz = async userId => {
+const markQuizAsCompleted = async (userId, quizId) => {
   try {
     const userQuizCollection = mongoose.connection.collection('userQuiz');
-    const user = await userQuizCollection.findOne({
-      userId,
-      completed: true,
-    });
-    return !!user;
+    await userQuizCollection.updateOne(
+      {
+        userId: parseInt(userId),
+        quizId: parseInt(quizId),
+      },
+      {
+        $set: {
+          completed: true,
+          completedAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
   } catch (error) {
-    console.error('Error checking user quiz completion:', error);
+    console.error('Error marking quiz as completed:', error);
     throw error;
+  }
+};
+
+const getLeaderboard = async (limit = 10) => {
+  try {
+    const userQuizCollection = mongoose.connection.collection('userQuiz');
+    return await userQuizCollection
+      .aggregate([
+        {
+          $group: {
+            _id: '$userId',
+            totalScore: { $sum: '$score' },
+            username: { $first: '$username' },
+            completedQuizzes: { $sum: { $cond: ['$completed', 1, 0] } },
+          },
+        },
+        { $sort: { totalScore: -1 } },
+        { $limit: limit },
+      ])
+      .toArray();
+  } catch (error) {
+    console.error('Error getting leaderboard:', error);
+    return [];
   }
 };
 
 module.exports = {
   connectToDatabase,
-  initializeDatabase,
   clearDatabase,
+  initializeDatabase,
   hasUserCompletedQuiz,
-  getConnection: () => mongoose.connection,
+  getUserQuizScore,
+  updateUserQuizScore,
+  markQuizAsCompleted,
+  getLeaderboard,
 };

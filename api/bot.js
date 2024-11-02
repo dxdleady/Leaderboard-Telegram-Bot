@@ -1,14 +1,11 @@
-// bot.js
-require('dotenv').config({
-  path: process.env.NODE_ENV === 'production' ? '.env' : '.env.local',
-});
-
+// api/bot.js
+const { createServer } = require('http');
+const { WebSocketServer } = require('ws');
+const wsManager = require('../services/websocketManager');
 const { Telegraf } = require('telegraf');
-const WebSocket = require('ws');
 const mongoose = require('mongoose');
 const config = require('../config/default');
 const webhookHandler = require('../handlers/webhookHandler');
-const wsManager = require('../services/websocketManager');
 const {
   connectToDatabase,
   initializeDatabase,
@@ -21,7 +18,7 @@ let bot;
 let wss;
 
 const setupWebSocketServer = server => {
-  wss = new WebSocket.Server({
+  wss = new WebSocketServer({
     server,
     path: '/ws',
     clientTracking: true,
@@ -64,7 +61,6 @@ const setupWebSocketServer = server => {
         wsManager.removeConnection(ws.userId);
         return ws.terminate();
       }
-
       ws.isAlive = false;
       ws.ping();
     });
@@ -87,9 +83,11 @@ const initializeBot = async (server = null) => {
       setupActionHandlers(bot);
 
       if (process.env.NODE_ENV === 'production') {
-        const domain = process.env.VERCEL_URL;
+        const domain = process.env.VERCEL_URL || process.env.DOMAIN;
         if (!domain) {
-          throw new Error('VERCEL_URL environment variable is not set');
+          throw new Error(
+            'VERCEL_URL or DOMAIN environment variable is not set'
+          );
         }
 
         const webhookUrl = `https://${domain}/api/bot`;
@@ -97,7 +95,7 @@ const initializeBot = async (server = null) => {
 
         // Setup WebSocket server if server instance is provided
         if (server) {
-          const wss = setupWebSocketServer(server);
+          wss = setupWebSocketServer(server);
           console.log('WebSocket server initialized');
         }
 
@@ -152,7 +150,7 @@ const cleanup = async () => {
   }
 
   // Close all active WebSocket connections
-  wsManager.connections.forEach((ws, userId) => {
+  wsManager.getActiveConnections().forEach(userId => {
     wsManager.removeConnection(userId);
   });
 
@@ -163,6 +161,36 @@ const cleanup = async () => {
   }
 
   console.log('Cleanup completed');
+};
+
+// API handler function
+const handler = async (req, res) => {
+  try {
+    await connectToDatabase();
+
+    // Handle WebSocket upgrade requests
+    if (req.headers.upgrade?.toLowerCase() === 'websocket') {
+      if (!wss) {
+        wss = setupWebSocketServer(req.socket.server);
+      }
+      wss.handleUpgrade(req, req.socket, Buffer.alloc(0), ws => {
+        wss.emit('connection', ws, req);
+      });
+      return;
+    }
+
+    // Initialize bot if needed
+    if (!bot) {
+      bot = await initializeBot(req.socket?.server);
+    }
+
+    // Handle webhook requests
+    await webhookHandler(req, res, bot);
+  } catch (error) {
+    console.error('Error in API handler:', error);
+    // Always return 200 to Telegram
+    res.status(200).json({ ok: true });
+  }
 };
 
 // Development mode startup
@@ -183,19 +211,12 @@ if (process.env.NODE_ENV !== 'production') {
     });
 }
 
-// Export handler for API endpoint
-module.exports = async (req, res) => {
-  try {
-    await connectToDatabase();
-
-    if (!bot) {
-      // Initialize bot with req.socket.server for WebSocket support
-      bot = await initializeBot(req.socket.server);
-    }
-
-    return webhookHandler(req, res, bot);
-  } catch (error) {
-    console.error('Error in API handler:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
+// Configuration for the API route
+handler.config = {
+  api: {
+    bodyParser: false,
+    externalResolver: true,
+  },
 };
+
+module.exports = handler;

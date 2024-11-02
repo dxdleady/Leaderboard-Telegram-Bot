@@ -1,16 +1,20 @@
+// handlers/commandHandlers.js
 const { escapeMarkdown } = require('../utils/helpers');
 const { getLatestQuizId } = require('../utils/helpers');
 const { hasUserCompletedQuiz } = require('../services/database');
 const { sendQuizQuestion } = require('../handlers/actionHandlers');
 const { quizzes } = require('../config/quizData');
 const mongoose = require('mongoose');
-const config = require('../config/default'); // Add this import
+const config = require('../config/default');
+const wsManager = require('../services/websocketManager');
 
 const setupCommandHandlers = bot => {
-  // Keep only one start command handler
+  // Start command handler
   bot.command('start', async ctx => {
     try {
-      const hasCompleted = await hasUserCompletedQuiz(ctx.from.id);
+      const userId = ctx.from.id;
+      const hasCompleted = await hasUserCompletedQuiz(userId);
+
       if (hasCompleted) {
         await ctx.reply(
           'You have already participated in this quiz. Good luck!',
@@ -19,6 +23,11 @@ const setupCommandHandlers = bot => {
           }
         );
         return;
+      }
+
+      // Delete the command message
+      if (ctx.message) {
+        await ctx.deleteMessage(ctx.message.message_id).catch(console.error);
       }
 
       const welcomeMessage = `
@@ -31,6 +40,7 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
 
       const latestQuizId = getLatestQuizId();
 
+      // Send welcome message with photo
       await ctx.replyWithPhoto(
         {
           url: 'https://drive.google.com/uc?id=1d4bbmOQWryf1QXzRg5rfP7YKWSd0QuKn',
@@ -50,6 +60,13 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
           },
         }
       );
+
+      if (wsManager.isConnected(userId)) {
+        wsManager.sendToUser(userId, {
+          type: 'quiz_welcome',
+          quizId: latestQuizId,
+        });
+      }
     } catch (error) {
       console.error('Error in start command:', error);
       await ctx.reply(
@@ -61,11 +78,10 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
   // Help Command
   bot.command('help', async ctx => {
     try {
-      await ctx
-        .deleteMessage()
-        .catch(error =>
-          console.log('Could not delete command message:', error.message)
-        );
+      // Delete command message
+      if (ctx.message) {
+        await ctx.deleteMessage(ctx.message.message_id).catch(console.error);
+      }
 
       const helpMessage = `📋 Available Commands:
 
@@ -73,7 +89,6 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
 /help - 📖 Show this help message
 /listquizzes - 📝 Show available quizzes
 /leaderboard - 🏆 Show top 10 players
-/currentleaderboard - 📊 Show detailed leaderboard (Admin only)
 
 📌 Usage Tips:
 • Commands and responses are private
@@ -97,7 +112,10 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
   // List Quizzes Command
   bot.command('listquizzes', async ctx => {
     try {
-      await ctx.deleteMessage().catch(console.error);
+      // Delete command message
+      if (ctx.message) {
+        await ctx.deleteMessage(ctx.message.message_id).catch(console.error);
+      }
 
       const userId = ctx.from.id;
       const userQuizCollection = mongoose.connection.collection('userQuiz');
@@ -124,6 +142,13 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
         parse_mode: 'MarkdownV2',
         protect_content: true,
       });
+
+      if (wsManager.isConnected(userId)) {
+        wsManager.sendToUser(userId, {
+          type: 'quiz_list',
+          completedQuizzes: completedQuizIds,
+        });
+      }
     } catch (error) {
       console.error('Error in /listquizzes command:', error);
       await ctx.reply(
@@ -138,7 +163,10 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
   // Leaderboard Command
   bot.command('leaderboard', async ctx => {
     try {
-      await ctx.deleteMessage().catch(console.error);
+      // Delete command message
+      if (ctx.message) {
+        await ctx.deleteMessage(ctx.message.message_id).catch(console.error);
+      }
 
       const userQuizCollection = mongoose.connection.collection('userQuiz');
       const leaderboard = await userQuizCollection
@@ -166,6 +194,13 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
         parse_mode: 'Markdown',
         protect_content: true,
       });
+
+      if (wsManager.isConnected(ctx.from.id)) {
+        wsManager.sendToUser(ctx.from.id, {
+          type: 'leaderboard_update',
+          leaderboard: leaderboard,
+        });
+      }
     } catch (error) {
       console.error('Error in leaderboard command:', error);
       await ctx.reply('An error occurred while fetching the leaderboard.', {
@@ -174,56 +209,14 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
     }
   });
 
-  // Current Leaderboard Command (Admin Only)
-  bot.command('currentleaderboard', async ctx => {
-    try {
-      await ctx.deleteMessage().catch(console.error);
-
-      if (
-        process.env.NODE_ENV === 'local' ||
-        config.bot.adminIds.includes(ctx.from.id)
-      ) {
-        const userQuizCollection = mongoose.connection.collection('userQuiz');
-        const leaderboard = await userQuizCollection
-          .find({ completed: true })
-          .toArray();
-
-        let leaderboardText = `📊 Detailed Leaderboard:\n\n`;
-
-        if (leaderboard.length === 0) {
-          leaderboardText += 'No completed quizzes yet.';
-        } else {
-          leaderboard.forEach((user, index) => {
-            leaderboardText += `${index + 1}. TG ID: ${user.userId} - ${
-              user.username || 'Unknown'
-            } - ${user.score} points\n`;
-          });
-        }
-
-        await ctx.reply(leaderboardText, {
-          protect_content: true,
-        });
-      } else {
-        await ctx.reply("You don't have permission to use this command.", {
-          protect_content: true,
-        });
-      }
-    } catch (error) {
-      console.error('Error in currentleaderboard command:', error);
-      await ctx.reply(
-        'An error occurred while fetching the detailed leaderboard.',
-        {
-          protect_content: true,
-        }
-      );
-    }
-  });
-
   // Quiz Commands
   Object.keys(quizzes).forEach(quizId => {
     bot.command(`quiz_${quizId}`, async ctx => {
       try {
-        await ctx.deleteMessage().catch(console.error);
+        // Delete command message
+        if (ctx.message) {
+          await ctx.deleteMessage(ctx.message.message_id).catch(console.error);
+        }
 
         if (await hasUserCompletedQuiz(ctx.from.id)) {
           await ctx.reply('You have already completed this quiz.', {
@@ -235,6 +228,7 @@ Good luck, Seekers, and don't forget to follow us on X and Telegram to stay upda
         await ctx.reply(`Starting quiz: ${quizzes[quizId].title}`, {
           protect_content: true,
         });
+
         await sendQuizQuestion(bot, ctx.chat.id, quizId, 0, ctx.from.id);
       } catch (error) {
         console.error('Error in quiz command:', error);
