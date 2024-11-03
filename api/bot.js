@@ -5,8 +5,10 @@ const {
   clearDatabase,
   connectToDatabase,
   initializeDatabase,
+  ensureDatabaseConnection,
 } = require('../services/database');
 const setupCommandHandlers = require('../handlers/commandHandlers');
+const { setupWebhook } = require('../handlers/webhookHandler');
 const { setupActionHandlers } = require('../handlers/actionHandlers');
 
 // Global bot instance
@@ -70,68 +72,6 @@ const initBot = async (force = false) => {
     throw error;
   } finally {
     isInitializing = false;
-  }
-};
-
-// Enhanced database connection with retry
-const ensureDatabaseConnection = async (retries = 3) => {
-  for (let i = 0; i < retries; i++) {
-    try {
-      if (mongoose.connection.readyState === 1) {
-        return true;
-      }
-
-      console.log(
-        `[DEBUG] Attempting database connection (attempt ${i + 1}/${retries})`
-      );
-      await connectToDatabase();
-      await initializeDatabase();
-      return true;
-    } catch (error) {
-      console.error(
-        `[DEBUG] Database connection attempt ${i + 1} failed:`,
-        error
-      );
-      if (i === retries - 1) throw error;
-      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // Exponential backoff
-    }
-  }
-  return false;
-};
-
-// First, modify the setupWebhook function
-const setupWebhook = async (currentBot, domain) => {
-  try {
-    const webhookUrl = `https://${domain}/api/bot`;
-    console.log('[DEBUG] Setting webhook URL:', webhookUrl);
-
-    // First delete existing webhook with dropping updates
-    await currentBot.telegram.deleteWebhook({ drop_pending_updates: true });
-
-    // Set webhook with more options
-    await currentBot.telegram.setWebhook(webhookUrl, {
-      drop_pending_updates: true,
-      allowed_updates: ['message', 'callback_query'],
-      max_connections: 100,
-    });
-
-    // Verify webhook setup
-    const webhookInfo = await currentBot.telegram.getWebhookInfo();
-    console.log('[DEBUG] Webhook info:', webhookInfo);
-
-    // Verify the URL matches
-    if (webhookInfo.url !== webhookUrl) {
-      console.error('[DEBUG] Webhook URL mismatch:', {
-        expected: webhookUrl,
-        actual: webhookInfo.url,
-      });
-      return false;
-    }
-
-    return true;
-  } catch (error) {
-    console.error('[DEBUG] Webhook setup error:', error);
-    return false;
   }
 };
 

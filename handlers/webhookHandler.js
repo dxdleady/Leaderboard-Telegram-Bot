@@ -11,6 +11,17 @@ const {
 } = require('../services/database');
 
 let bot = null;
+let lastInitTime = 0;
+
+const verifyTelegramWebhook = (token, body, signature) => {
+  if (!signature) return false;
+
+  const secret = crypto.createHash('sha256').update(token).digest();
+
+  const hmac = crypto.createHmac('sha256', secret).update(body).digest('hex');
+
+  return hmac === signature;
+};
 
 const handler = async (req, res) => {
   const startTime = Date.now();
@@ -22,7 +33,7 @@ const handler = async (req, res) => {
   );
 
   try {
-    // Health check endpoint - always available
+    // Health check endpoint
     if (req.method === 'GET') {
       const status = {
         ok: true,
@@ -46,40 +57,30 @@ const handler = async (req, res) => {
     if (req.method === 'POST') {
       console.log('[DEBUG] Processing webhook update...');
 
-      // Always parse the body first
+      // Get raw body
       const buf = await rawBody(req);
       const text = buf.toString();
 
-      // Log incoming data for debugging
-      console.log('[DEBUG] Received webhook data length:', text.length);
-      console.log('[DEBUG] First 200 characters:', text.substring(0, 200));
+      // Verify webhook signature
+      const telegramSignature = req.headers['x-telegram-bot-api-secret-token'];
+
+      if (
+        !verifyTelegramWebhook(process.env.BOT_TOKEN, text, telegramSignature)
+      ) {
+        console.error('[DEBUG] Invalid webhook signature');
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
 
       try {
-        // Parse the update
         const update = JSON.parse(text);
 
-        // Ensure database connection
-        console.log('[DEBUG] Ensuring database connection...');
-        await ensureDatabaseConnection();
-
         // Initialize or get bot instance
-        console.log('[DEBUG] Getting bot instance...');
-        const currentBot = await initBot();
+        const currentBot = bot || initBot();
         if (!currentBot) {
           throw new Error('Failed to initialize bot');
         }
 
-        console.log(
-          '[DEBUG] Update type:',
-          update.message
-            ? 'message'
-            : update.callback_query
-            ? 'callback_query'
-            : 'other'
-        );
-
-        // Process update with timeout
-        console.log('[DEBUG] Processing update...');
+        // Process update
         await currentBot.handleUpdate(update);
 
         const processingTime = Date.now() - startTime;
@@ -89,20 +90,16 @@ const handler = async (req, res) => {
           'ms'
         );
 
-        // Always return 200 OK to Telegram
         return res.status(200).json({ ok: true });
       } catch (error) {
         console.error('[DEBUG] Error processing webhook update:', error);
-        // Still return 200 to Telegram even on error
         return res.status(200).json({ ok: true });
       }
     }
 
-    // Method not allowed
     return res.status(405).json({ error: 'Method not allowed' });
   } catch (error) {
-    console.error('[DEBUG] Critical handler error:', error);
-    // Always return 200 to Telegram
+    console.error('[DEBUG] Handler error:', error);
     return res.status(200).json({ ok: true });
   }
 };
@@ -130,11 +127,13 @@ const initBot = () => {
   return newBot;
 };
 
-// Updated webhook setup function
 const setupWebhook = async (currentBot, domain) => {
   try {
     const webhookUrl = `https://${domain}/api/bot`;
     console.log('[DEBUG] Setting webhook URL:', webhookUrl);
+
+    // Generate a secret token for webhook verification
+    const secretToken = crypto.randomBytes(32).toString('hex');
 
     // Delete existing webhook first
     await currentBot.telegram.deleteWebhook({ drop_pending_updates: true });
@@ -142,9 +141,13 @@ const setupWebhook = async (currentBot, domain) => {
     // Set up new webhook with secret token
     await currentBot.telegram.setWebhook(webhookUrl, {
       drop_pending_updates: true,
-      allowed_updates: ['message', 'callback_query'], // Specify which updates to receive
+      allowed_updates: ['message', 'callback_query'],
       max_connections: 100,
+      secret_token: secretToken, // Add secret token for verification
     });
+
+    // Store the secret token in environment variables or your config
+    process.env.WEBHOOK_SECRET_TOKEN = secretToken;
 
     // Verify webhook setup
     const webhookInfo = await currentBot.telegram.getWebhookInfo();
@@ -154,11 +157,10 @@ const setupWebhook = async (currentBot, domain) => {
       throw new Error('Webhook URL mismatch');
     }
 
-    console.log('[DEBUG] Webhook setup successful');
     return true;
   } catch (error) {
     console.error('[DEBUG] Webhook setup error:', error);
-    throw error;
+    return false;
   }
 };
 
@@ -258,4 +260,4 @@ handler.config = {
   },
 };
 
-module.exports = handler;
+module.exports = { handler, setupWebhook };
