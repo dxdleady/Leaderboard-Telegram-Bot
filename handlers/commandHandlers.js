@@ -119,11 +119,12 @@ const setupCommandHandlers = bot => {
     }
   });
 
-  // List Quizzes Command
   bot.command('listquizzes', async ctx => {
     try {
       const userId = ctx.from.id;
       const userQuizCollection = mongoose.connection.collection('userQuiz');
+
+      console.log('[DEBUG] Getting quiz list for user:', userId);
 
       // Retrieve completed quizzes for the user
       const completedQuizzes = await userQuizCollection
@@ -131,50 +132,40 @@ const setupCommandHandlers = bot => {
         .toArray();
       const completedQuizIds = completedQuizzes.map(quiz => quiz.quizId);
 
+      console.log('[DEBUG] Completed quizzes:', completedQuizIds);
+
       // Initialize quiz list message
       let quizList = '📚 *Available Quizzes*\n\n';
 
       // Iterate over quizzes and format list with completion status
       for (const [quizId, quiz] of Object.entries(quizzes)) {
         const isCompleted = completedQuizIds.includes(parseInt(quizId));
-        quizList += `${isCompleted ? '✅' : '🔸'} /quiz_${quizId} - ${
-          quiz.title
-        } ${isCompleted ? '(Completed)' : '(Available)'}\n`;
+        quizList += `${
+          isCompleted ? '✅' : '🔸'
+        } Quiz ${quizId} - ${escapeMarkdown(quiz.title)} ${
+          isCompleted ? '\\(Completed\\)' : '\\(Available\\)'
+        }\n`;
       }
 
       // Send the list of quizzes to the user
       await ctx.reply(quizList, {
-        parse_mode: 'Markdown',
+        parse_mode: 'MarkdownV2',
         protect_content: true,
       });
 
-      // If WebSocket is connected, send the quiz list update to the user
-      if (wsManager.isConnected(userId)) {
-        wsManager.sendToUser(userId, {
-          type: 'quiz_list',
-          completedQuizzes: completedQuizIds,
-        });
-      }
+      console.log('[DEBUG] Quiz list sent successfully');
     } catch (error) {
-      console.error('Error in listquizzes command:', error);
-
-      // Notify user of the error
+      console.error('[DEBUG] Error in listquizzes command:', error);
       await ctx.reply(
         'An error occurred while listing quizzes. Please try again.'
       );
     }
   });
 
-  // Leaderboard Command
+  // For leaderboard command:
   bot.command('leaderboard', async ctx => {
     try {
       console.log('[DEBUG] Fetching leaderboard data...');
-
-      // Ensure database connection
-      if (mongoose.connection.readyState !== 1) {
-        console.log('[DEBUG] Database not connected, attempting connection...');
-        await connectToDatabase();
-      }
 
       const userQuizCollection = mongoose.connection.collection('userQuiz');
 
@@ -182,26 +173,17 @@ const setupCommandHandlers = bot => {
       const leaderboard = await userQuizCollection
         .aggregate([
           {
-            $match: { completed: true }, // Only include completed quizzes
+            $match: { completed: true },
           },
           {
             $group: {
               _id: '$userId',
               totalScore: { $sum: '$score' },
-              username: { $last: '$username' }, // Take the most recent username
               quizCount: { $sum: 1 },
             },
           },
           {
-            $match: {
-              totalScore: { $gt: 0 }, // Only include users with points
-            },
-          },
-          {
-            $sort: {
-              totalScore: -1,
-              quizCount: -1,
-            },
+            $sort: { totalScore: -1, quizCount: -1 },
           },
           {
             $limit: 10,
@@ -225,19 +207,16 @@ const setupCommandHandlers = bot => {
       // Format leaderboard message
       let message = '🏆 *QUIZ LEADERBOARD* 🏆\n\n';
 
-      leaderboard.forEach((entry, index) => {
-        const medal =
-          index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : '🎯';
-        const username = entry.username || 'Anonymous Player';
-        const position = `${index + 1}`.padStart(2, ' ');
+      for (let i = 0; i < leaderboard.length; i++) {
+        const entry = leaderboard[i];
+        const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '🎯';
+        const position = `${i + 1}`.padStart(2, ' ');
 
-        message += `${medal} ${position}\\. *${escapeMarkdown(username)}*\n`;
-        message += `    ↳ Score: ${entry.totalScore} points \\(${
+        message += `${medal} ${position}\\. User ID: ${entry._id}\n`;
+        message += `    Score: ${entry.totalScore} points \\(${
           entry.quizCount
         } ${entry.quizCount === 1 ? 'quiz' : 'quizzes'}\\)\n\n`;
-      });
-
-      message += '\n_Complete more quizzes to climb the ranks\\!_ 🚀';
+      }
 
       await ctx.reply(message, {
         parse_mode: 'MarkdownV2',
@@ -247,12 +226,8 @@ const setupCommandHandlers = bot => {
       console.log('[DEBUG] Leaderboard sent successfully');
     } catch (error) {
       console.error('[DEBUG] Leaderboard error:', error);
-
       await ctx.reply(
-        'Sorry, there was an error fetching the leaderboard. Please try again later.',
-        {
-          protect_content: true,
-        }
+        'Sorry, there was an error fetching the leaderboard. Please try again later.'
       );
     }
   });
