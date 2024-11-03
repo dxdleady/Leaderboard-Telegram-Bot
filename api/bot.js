@@ -221,6 +221,15 @@ const startLocalBot = async () => {
     // Ensure database connection
     await ensureDatabaseConnection();
 
+    // Handle cleanup if requested
+    if (process.argv.includes('cleanup')) {
+      console.log('[DEBUG] Running database cleanup...');
+      await clearDatabase();
+      console.log('[DEBUG] Database cleanup completed');
+      await initializeDatabase();
+      console.log('[DEBUG] Database reinitialized');
+    }
+
     // Initialize bot
     const currentBot = await initBot(true);
     if (!currentBot) {
@@ -268,6 +277,9 @@ if (process.env.VERCEL_URL && process.env.NODE_ENV === 'production') {
 } else if (require.main === module) {
   // Local development
   console.log('[DEBUG] Starting in local development mode');
+  if (process.argv.includes('cleanup')) {
+    console.log('[DEBUG] Cleanup mode enabled');
+  }
   startLocalBot().catch(error => {
     console.error('[DEBUG] Local startup error:', error);
     process.exit(1);
