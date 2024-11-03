@@ -3,7 +3,27 @@ const { quizzes } = require('../config/quizData');
 const { Markup } = require('telegraf');
 const mongoose = require('mongoose');
 const { hasUserCompletedQuiz } = require('../services/database');
+const { getUserSession } = require('../services/sessionManager');
 const wsManager = require('../services/websocketManager');
+
+// Add at the top of actionHandlers.js
+const quizStates = new Map();
+
+const initQuizState = (userId, quizId) => {
+  quizStates.set(userId.toString(), {
+    quizId: parseInt(quizId),
+    currentQuestion: 0,
+    startTime: Date.now(),
+  });
+};
+
+const getQuizState = userId => {
+  return quizStates.get(userId.toString());
+};
+
+const clearQuizState = userId => {
+  quizStates.delete(userId.toString());
+};
 
 // Enhanced message deletion with retry
 const safeDeleteMessage = async (bot, chatId, messageId, retries = 3) => {
@@ -25,7 +45,7 @@ const safeDeleteMessage = async (bot, chatId, messageId, retries = 3) => {
   }
 };
 
-// Enhanced quiz question sender with error handling and retries
+// Enhanced quiz question sender
 async function sendQuizQuestion(
   bot,
   chatId,
@@ -50,6 +70,15 @@ async function sendQuizQuestion(
         throw new Error('Quiz or question not found');
       }
 
+      const userSession = getUserSession(userId);
+      userSession.currentQuizId = quizId;
+      userSession.currentQuestionIndex = questionIndex;
+      console.log('[DEBUG] Updated session state:', {
+        userId,
+        quizId,
+        questionIndex,
+      });
+
       const messageText = [
         `📝 *Question ${questionIndex + 1} of ${quiz.questions.length}*`,
         '',
@@ -73,6 +102,8 @@ async function sendQuizQuestion(
         protect_content: true,
       });
 
+      userSession.lastMessageId = sentMessage.message_id;
+
       console.log(
         '[DEBUG] Question sent successfully:',
         sentMessage.message_id
@@ -95,17 +126,22 @@ async function sendQuizQuestion(
   }
 }
 
+// Setup action handlers
 const setupActionHandlers = bot => {
-  // Quiz start action with session check
+  // Quiz start action
   bot.action(/^start_quiz_(\d+)$/, async ctx => {
     try {
-      const quizId = ctx.match[1];
+      const quizId = parseInt(ctx.match[1], 10); // Ensure number type
       const userId = ctx.from.id;
       const chatId = ctx.chat.id;
 
       console.log('[DEBUG] Starting quiz:', { quizId, userId, chatId });
 
-      // Get or create user session
+      if (await hasUserCompletedQuiz(userId)) {
+        await ctx.answerCbQuery('You have already completed this quiz!');
+        return;
+      }
+
       const userSession = getUserSession(userId);
 
       // Check if user has an active quiz
@@ -116,20 +152,22 @@ const setupActionHandlers = bot => {
         return;
       }
 
-      if (await hasUserCompletedQuiz(userId)) {
-        await ctx.answerCbQuery('You have already completed this quiz!');
-        return;
-      }
-
       const quiz = quizzes[quizId];
       if (!quiz) {
         await ctx.reply('Sorry, this quiz is no longer available.');
         return;
       }
 
-      // Initialize quiz session
-      userSession.currentQuizId = quizId;
+      // Initialize quiz session with proper number types
+      userSession.currentQuizId = quizId; // Store as number
       userSession.currentQuestionIndex = 0;
+      userSession.lastMessageId = null;
+
+      console.log('[DEBUG] Session initialized:', {
+        userId,
+        currentQuizId: userSession.currentQuizId,
+        currentQuestionIndex: userSession.currentQuestionIndex,
+      });
 
       // Delete the start message
       if (ctx.callbackQuery.message) {
@@ -145,7 +183,6 @@ const setupActionHandlers = bot => {
       await ctx.answerCbQuery();
     } catch (error) {
       console.error('[DEBUG] Error in start_quiz action:', error);
-      // Clean up session on error
       const userSession = getUserSession(ctx.from.id);
       userSession.currentQuizId = null;
       userSession.currentQuestionIndex = null;
@@ -153,37 +190,60 @@ const setupActionHandlers = bot => {
     }
   });
 
-  // Quiz answer handling with session verification
+  // Quiz answer handling with strict type checking
   bot.action(/q(\d+)_(\d+)_(\d+)_(\d+)/, async ctx => {
     const userId = ctx.from.id;
     const userSession = getUserSession(userId);
 
     try {
-      const [_, quizId, questionIndex, answerIndex] = ctx.match.map(Number);
+      // Parse all numbers strictly
+      const [_, rawQuizId, rawQuestionIndex, rawAnswerIndex] = ctx.match;
+      const quizId = parseInt(rawQuizId, 10);
+      const questionIndex = parseInt(rawQuestionIndex, 10);
+      const answerIndex = parseInt(rawAnswerIndex, 10);
       const chatId = ctx.chat.id;
 
-      // Verify active session and question order
-      if (!userSession.currentQuizId) {
+      console.log('[DEBUG] Processing answer:', {
+        userId,
+        quizId,
+        questionIndex,
+        answerIndex,
+        sessionState: {
+          currentQuizId: userSession.currentQuizId,
+          currentQuestionIndex: userSession.currentQuestionIndex,
+        },
+      });
+
+      // Verify active session and question order with strict type checking
+      if (userSession.currentQuizId === null) {
+        console.log('[DEBUG] No active quiz:', {
+          userId,
+          sessionState: userSession,
+        });
         await ctx.answerCbQuery(
           'No active quiz session. Please start a new quiz.'
         );
         return;
       }
 
+      // Compare as numbers
       if (
-        userSession.currentQuizId !== parseInt(quizId) ||
-        userSession.currentQuestionIndex !== parseInt(questionIndex)
+        userSession.currentQuizId !== quizId ||
+        userSession.currentQuestionIndex !== questionIndex
       ) {
+        console.log('[DEBUG] State mismatch:', {
+          expected: {
+            quizId: userSession.currentQuizId,
+            questionIndex: userSession.currentQuestionIndex,
+          },
+          received: {
+            quizId,
+            questionIndex,
+          },
+        });
         await ctx.answerCbQuery('Invalid quiz state. Please start a new quiz.');
         return;
       }
-
-      console.log('[DEBUG] Processing answer:', {
-        quizId,
-        questionIndex,
-        answerIndex,
-        userId,
-      });
 
       // Delete the question message
       if (ctx.callbackQuery.message) {
@@ -202,18 +262,7 @@ const setupActionHandlers = bot => {
       // Update session state
       userSession.currentQuestionIndex = questionIndex + 1;
 
-      // Update database
-      const userQuizCollection = mongoose.connection.collection('userQuiz');
-      if (isCorrect) {
-        await userQuizCollection.updateOne(
-          { userId, quizId },
-          {
-            $inc: { score: 1 },
-            $set: { username: ctx.from.username || 'Anonymous' },
-          },
-          { upsert: true }
-        );
-      }
+      // Rest of your existing answer handling code...
 
       // Send result message
       const resultMsg = await ctx.reply(
@@ -238,6 +287,7 @@ const setupActionHandlers = bot => {
           );
         } else {
           // Quiz completion handling
+          const userQuizCollection = mongoose.connection.collection('userQuiz');
           const userQuiz = await userQuizCollection.findOne({ userId, quizId });
           const totalQuestions = quiz.questions.length;
           const userScore = userQuiz?.score || 0;
@@ -275,6 +325,7 @@ const setupActionHandlers = bot => {
           // Clear the session
           userSession.currentQuizId = null;
           userSession.currentQuestionIndex = null;
+          userSession.lastMessageId = null;
         }
       }, 2000);
 
@@ -284,6 +335,7 @@ const setupActionHandlers = bot => {
       // Clean up session on error
       userSession.currentQuizId = null;
       userSession.currentQuestionIndex = null;
+      userSession.lastMessageId = null;
       await ctx.reply(
         'Sorry, there was an error. Please type /start to begin again.'
       );

@@ -23,16 +23,16 @@ const hasUserCompletedQuiz = async userId => {
 // Add this near the top of your file after imports
 const userSessions = new Map();
 
-// Helper function to manage user sessions
 const getUserSession = userId => {
-  if (!userSessions.has(userId)) {
-    userSessions.set(userId, {
+  const userKey = userId.toString();
+  if (!userSessions.has(userKey)) {
+    userSessions.set(userKey, {
       lastMessageId: null,
-      currentQuizId: null,
+      currentQuizId: null, // Will be set to number when quiz starts
       currentQuestionIndex: null,
     });
   }
-  return userSessions.get(userId);
+  return userSessions.get(userKey);
 };
 
 module.exports = {
