@@ -7,6 +7,7 @@ const { quizzes } = require('../config/quizData');
 const mongoose = require('mongoose');
 const config = require('../config/default');
 const wsManager = require('../services/websocketManager');
+const { Markup } = require('telegraf');
 
 // Helper function for safe message deletion
 const safeDeleteMessage = async (ctx, messageId) => {
@@ -137,19 +138,40 @@ const setupCommandHandlers = bot => {
       // Initialize quiz list message
       let quizList = '📚 *Available Quizzes*\n\n';
 
+      // Function to escape all special characters for MarkdownV2
+      const escapeSpecialChars = text => {
+        return text.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
+      };
+
       // Iterate over quizzes and format list with completion status
       for (const [quizId, quiz] of Object.entries(quizzes)) {
         const isCompleted = completedQuizIds.includes(parseInt(quizId));
-        quizList += `${
-          isCompleted ? '✅' : '🔸'
-        } Quiz ${quizId} - ${escapeMarkdown(quiz.title)} ${
-          isCompleted ? '\\(Completed\\)' : '\\(Available\\)'
-        }\n`;
+        const statusText = isCompleted ? 'Completed' : 'Available';
+        const title = escapeSpecialChars(quiz.title);
+
+        if (isCompleted) {
+          // For completed quizzes, show without link
+          quizList += `✅ Quiz ${quizId} ${title} \\(${statusText}\\)\n`;
+        } else {
+          // For incomplete quizzes, add a clickable callback button
+          quizList += `🔸 Quiz ${quizId} ${title} \\(${statusText}\\)\n`;
+        }
       }
 
-      // Send the list of quizzes to the user
+      // Add inline keyboard buttons for incomplete quizzes
+      const buttons = Object.entries(quizzes)
+        .filter(([quizId]) => !completedQuizIds.includes(parseInt(quizId)))
+        .map(([quizId, quiz]) => [
+          Markup.button.callback(
+            `Start Quiz ${quizId}`,
+            `start_quiz_${quizId}`
+          ),
+        ]);
+
+      // Send message with inline keyboard
       await ctx.reply(quizList, {
         parse_mode: 'MarkdownV2',
+        ...Markup.inlineKeyboard(buttons),
         protect_content: true,
       });
 

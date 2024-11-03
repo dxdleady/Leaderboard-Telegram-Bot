@@ -14,6 +14,7 @@ const initQuizState = (userId, quizId) => {
     quizId: parseInt(quizId),
     currentQuestion: 0,
     startTime: Date.now(),
+    answeredQuestions: new Set(),
   });
 };
 
@@ -65,6 +66,7 @@ async function sendQuizQuestion(
 
       const quiz = quizzes[quizId];
       const questionData = quiz.questions[questionIndex];
+      const quizState = getQuizState(userId);
 
       if (!quiz || !questionData) {
         throw new Error('Quiz or question not found');
@@ -88,10 +90,12 @@ async function sendQuizQuestion(
       ].join('\n');
 
       const buttons = questionData.options.map((option, index) => {
+        const isAnswered = quizState.answeredQuestions.has(questionIndex);
         return [
           Markup.button.callback(
-            option,
-            `q${quizId}_${questionIndex}_${index}_${userId}`
+            isAnswered ? `${option} ✓` : option,
+            `q${quizId}_${questionIndex}_${index}_${userId}`,
+            isAnswered
           ),
         ];
       });
@@ -131,24 +135,23 @@ const setupActionHandlers = bot => {
   // Quiz start action
   bot.action(/^start_quiz_(\d+)$/, async ctx => {
     try {
-      const quizId = parseInt(ctx.match[1], 10); // Ensure number type
+      const quizId = parseInt(ctx.match[1], 10);
       const userId = ctx.from.id;
       const chatId = ctx.chat.id;
 
       console.log('[DEBUG] Starting quiz:', { quizId, userId, chatId });
 
-      if (await hasUserCompletedQuiz(userId)) {
-        await ctx.answerCbQuery('You have already completed this quiz!');
+      // Check if user has an active quiz state
+      const existingState = getQuizState(userId);
+      if (existingState) {
+        await ctx.answerCbQuery(
+          'Please finish your current quiz before starting a new one!'
+        );
         return;
       }
 
-      const userSession = getUserSession(userId);
-
-      // Check if user has an active quiz
-      if (userSession.currentQuizId !== null) {
-        await ctx.answerCbQuery(
-          'You already have an active quiz. Please finish it first!'
-        );
+      if (await hasUserCompletedQuiz(userId)) {
+        await ctx.answerCbQuery('You have already completed this quiz!');
         return;
       }
 
@@ -158,8 +161,10 @@ const setupActionHandlers = bot => {
         return;
       }
 
-      // Initialize quiz session with proper number types
-      userSession.currentQuizId = quizId; // Store as number
+      // Initialize new quiz state and session
+      initQuizState(userId, quizId);
+      const userSession = getUserSession(userId);
+      userSession.currentQuizId = quizId;
       userSession.currentQuestionIndex = 0;
       userSession.lastMessageId = null;
 
@@ -183,6 +188,7 @@ const setupActionHandlers = bot => {
       await ctx.answerCbQuery();
     } catch (error) {
       console.error('[DEBUG] Error in start_quiz action:', error);
+      clearQuizState(ctx.from.id);
       const userSession = getUserSession(ctx.from.id);
       userSession.currentQuizId = null;
       userSession.currentQuestionIndex = null;
@@ -195,9 +201,9 @@ const setupActionHandlers = bot => {
     const userId = ctx.from.id;
     const userSession = getUserSession(userId);
     const chatId = ctx.chat.id;
+    const quizState = getQuizState(userId);
 
     try {
-      // Parse all numbers strictly
       const [_, rawQuizId, rawQuestionIndex, rawAnswerIndex] = ctx.match;
       const quizId = parseInt(rawQuizId, 10);
       const questionIndex = parseInt(rawQuestionIndex, 10);
@@ -208,33 +214,33 @@ const setupActionHandlers = bot => {
         quizId,
         questionIndex,
         answerIndex,
-        sessionState: {
-          currentQuizId: userSession.currentQuizId,
-          currentQuestionIndex: userSession.currentQuestionIndex,
-        },
+        quizState,
       });
 
-      // Verify active session and question order
-      if (userSession.currentQuizId === null) {
-        console.log('[DEBUG] No active quiz:', {
-          userId,
-          sessionState: userSession,
-        });
+      // Verify quiz state exists
+      if (!quizState) {
+        console.log('[DEBUG] No active quiz:', { userId });
         await ctx.answerCbQuery(
           'No active quiz session. Please start a new quiz.'
         );
         return;
       }
 
-      // Compare as numbers
+      // Check if question was already answered
+      if (quizState.answeredQuestions.has(questionIndex)) {
+        await ctx.answerCbQuery('You have already answered this question!');
+        return;
+      }
+
+      // Verify current question matches
       if (
-        userSession.currentQuizId !== quizId ||
-        userSession.currentQuestionIndex !== questionIndex
+        quizState.quizId !== quizId ||
+        quizState.currentQuestion !== questionIndex
       ) {
         console.log('[DEBUG] State mismatch:', {
           expected: {
-            quizId: userSession.currentQuizId,
-            questionIndex: userSession.currentQuestionIndex,
+            quizId: quizState.quizId,
+            questionIndex: quizState.currentQuestion,
           },
           received: {
             quizId,
@@ -245,7 +251,11 @@ const setupActionHandlers = bot => {
         return;
       }
 
-      // Delete the question message directly
+      // Mark question as answered immediately
+      quizState.answeredQuestions.add(questionIndex);
+      quizState.currentQuestion = questionIndex + 1;
+
+      // Delete the question message
       if (ctx.callbackQuery.message) {
         await safeDeleteMessage(
           bot,
@@ -262,7 +272,7 @@ const setupActionHandlers = bot => {
       // Update session state
       userSession.currentQuestionIndex = questionIndex + 1;
 
-      // Send result message directly
+      // Send result message
       const resultMsg = await ctx.reply(
         isCorrect
           ? `✅ Correct answer! 🎉\n\n🔗 Read full article: ${questionData.link}`
@@ -270,13 +280,14 @@ const setupActionHandlers = bot => {
         { protect_content: true }
       );
 
-      // Delete result message
-      await safeDeleteMessage(bot, chatId, resultMsg.message_id);
+      // Delete result message after delay
+      setTimeout(async () => {
+        await safeDeleteMessage(bot, chatId, resultMsg.message_id);
+      }, 2000);
 
       // Send next question or complete quiz
-      const nextQuestionIndex = questionIndex + 1;
-      if (nextQuestionIndex < quiz.questions.length) {
-        await sendQuizQuestion(bot, chatId, quizId, nextQuestionIndex, userId);
+      if (questionIndex + 1 < quiz.questions.length) {
+        await sendQuizQuestion(bot, chatId, quizId, questionIndex + 1, userId);
       } else {
         // Quiz completion handling
         const userQuizCollection = mongoose.connection.collection('userQuiz');
@@ -312,7 +323,8 @@ const setupActionHandlers = bot => {
           { upsert: true }
         );
 
-        // Clear the session
+        // Clear both quiz state and session
+        clearQuizState(userId);
         userSession.currentQuizId = null;
         userSession.currentQuestionIndex = null;
         userSession.lastMessageId = null;
@@ -321,6 +333,7 @@ const setupActionHandlers = bot => {
       await ctx.answerCbQuery();
     } catch (error) {
       console.error('[DEBUG] Error processing answer:', error);
+      clearQuizState(userId);
       userSession.currentQuizId = null;
       userSession.currentQuestionIndex = null;
       userSession.lastMessageId = null;
