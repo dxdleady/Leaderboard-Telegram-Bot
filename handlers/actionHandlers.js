@@ -190,10 +190,11 @@ const setupActionHandlers = bot => {
     }
   });
 
-  // Quiz answer handling with strict type checking
+  // Quiz answer handling
   bot.action(/q(\d+)_(\d+)_(\d+)_(\d+)/, async ctx => {
     const userId = ctx.from.id;
     const userSession = getUserSession(userId);
+    const chatId = ctx.chat.id;
 
     try {
       // Parse all numbers strictly
@@ -201,7 +202,6 @@ const setupActionHandlers = bot => {
       const quizId = parseInt(rawQuizId, 10);
       const questionIndex = parseInt(rawQuestionIndex, 10);
       const answerIndex = parseInt(rawAnswerIndex, 10);
-      const chatId = ctx.chat.id;
 
       console.log('[DEBUG] Processing answer:', {
         userId,
@@ -214,7 +214,7 @@ const setupActionHandlers = bot => {
         },
       });
 
-      // Verify active session and question order with strict type checking
+      // Verify active session and question order
       if (userSession.currentQuizId === null) {
         console.log('[DEBUG] No active quiz:', {
           userId,
@@ -245,7 +245,7 @@ const setupActionHandlers = bot => {
         return;
       }
 
-      // Delete the question message
+      // Delete the question message directly
       if (ctx.callbackQuery.message) {
         await safeDeleteMessage(
           bot,
@@ -262,9 +262,7 @@ const setupActionHandlers = bot => {
       // Update session state
       userSession.currentQuestionIndex = questionIndex + 1;
 
-      // Rest of your existing answer handling code...
-
-      // Send result message
+      // Send result message directly
       const resultMsg = await ctx.reply(
         isCorrect
           ? `✅ Correct answer! 🎉\n\n🔗 Read full article: ${questionData.link}`
@@ -272,67 +270,57 @@ const setupActionHandlers = bot => {
         { protect_content: true }
       );
 
-      // Schedule next question or end quiz
-      setTimeout(async () => {
-        await safeDeleteMessage(bot, chatId, resultMsg.message_id);
+      // Delete result message
+      await safeDeleteMessage(bot, chatId, resultMsg.message_id);
 
-        const nextQuestionIndex = questionIndex + 1;
-        if (nextQuestionIndex < quiz.questions.length) {
-          await sendQuizQuestion(
-            bot,
-            chatId,
-            quizId,
-            nextQuestionIndex,
-            userId
-          );
-        } else {
-          // Quiz completion handling
-          const userQuizCollection = mongoose.connection.collection('userQuiz');
-          const userQuiz = await userQuizCollection.findOne({ userId, quizId });
-          const totalQuestions = quiz.questions.length;
-          const userScore = userQuiz?.score || 0;
-          const scorePercentage = Math.round(
-            (userScore / totalQuestions) * 100
-          );
+      // Send next question or complete quiz
+      const nextQuestionIndex = questionIndex + 1;
+      if (nextQuestionIndex < quiz.questions.length) {
+        await sendQuizQuestion(bot, chatId, quizId, nextQuestionIndex, userId);
+      } else {
+        // Quiz completion handling
+        const userQuizCollection = mongoose.connection.collection('userQuiz');
+        const userQuiz = await userQuizCollection.findOne({ userId, quizId });
+        const totalQuestions = quiz.questions.length;
+        const userScore = userQuiz?.score || 0;
+        const scorePercentage = Math.round((userScore / totalQuestions) * 100);
 
-          const completionText = [
-            '🎉 *Quiz Completed\\!*',
-            '',
-            '📊 *Your Results:*',
-            `✓ Score: ${userScore}/${totalQuestions} \\(${scorePercentage}%\\)`,
-            scorePercentage === 100
-              ? "🏆 Perfect Score\\! You're eligible for the prize draw\\!"
-              : 'Keep trying to get a perfect score\\!',
-            '',
-            '📋 *Available Commands:*',
-            '/start \\- Start a new quiz',
-            '/help \\- Show all available commands',
-            '/listquizzes \\- Show available quizzes',
-            '/leaderboard \\- View top 10 players',
-          ].join('\n');
+        const completionText = [
+          '🎉 *Quiz Completed\\!*',
+          '',
+          '📊 *Your Results:*',
+          `✓ Score: ${userScore}/${totalQuestions} \\(${scorePercentage}%\\)`,
+          scorePercentage === 100
+            ? "🏆 Perfect Score\\! You're eligible for the prize draw\\!"
+            : 'Keep trying to get a perfect score\\!',
+          '',
+          '📋 *Available Commands:*',
+          '/start \\- Start a new quiz',
+          '/help \\- Show all available commands',
+          '/listquizzes \\- Show available quizzes',
+          '/leaderboard \\- View top 10 players',
+        ].join('\n');
 
-          await ctx.reply(completionText, {
-            parse_mode: 'MarkdownV2',
-            protect_content: true,
-          });
+        await ctx.reply(completionText, {
+          parse_mode: 'MarkdownV2',
+          protect_content: true,
+        });
 
-          await userQuizCollection.updateOne(
-            { userId, quizId },
-            { $set: { completed: true } },
-            { upsert: true }
-          );
+        await userQuizCollection.updateOne(
+          { userId, quizId },
+          { $set: { completed: true } },
+          { upsert: true }
+        );
 
-          // Clear the session
-          userSession.currentQuizId = null;
-          userSession.currentQuestionIndex = null;
-          userSession.lastMessageId = null;
-        }
-      }, 2000);
+        // Clear the session
+        userSession.currentQuizId = null;
+        userSession.currentQuestionIndex = null;
+        userSession.lastMessageId = null;
+      }
 
       await ctx.answerCbQuery();
     } catch (error) {
       console.error('[DEBUG] Error processing answer:', error);
-      // Clean up session on error
       userSession.currentQuizId = null;
       userSession.currentQuestionIndex = null;
       userSession.lastMessageId = null;

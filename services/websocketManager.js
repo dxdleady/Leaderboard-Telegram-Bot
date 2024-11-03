@@ -7,6 +7,13 @@ class WebSocketManager {
     this.reconnectTimeouts = new Map();
     this.pendingPromises = new Map(); // Track pending promises
   }
+  // Add this method that was missing
+  initializeQueue(userId) {
+    if (!this.messageQueues.has(userId)) {
+      this.messageQueues.set(userId, []);
+      this.processingQueues.set(userId, false);
+    }
+  }
 
   addConnection(userId, ws) {
     // Clear any existing reconnect timeout
