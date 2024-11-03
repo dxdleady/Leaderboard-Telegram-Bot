@@ -14,6 +14,7 @@ const safeDeleteMessage = async (ctx, messageId) => {
   try {
     if (messageId) {
       await ctx.deleteMessage(messageId);
+    } else {
     }
   } catch (error) {
     // Ignore deletion errors and continue
@@ -97,19 +98,31 @@ const setupCommandHandlers = bot => {
   // Help Command
   bot.command('help', async ctx => {
     try {
-      const helpMessage = `📋 Available Commands:
+      const isAdmin = config.bot.adminIds.includes(ctx.from.id);
+      // Base commands for all users
+      const baseCommands = [
+        '🤖 *Available Commands:*',
+        '',
+        '/start \\- Start the bot and get quiz options',
+        '/help \\- Show this help message',
+        '/listquizzes \\- Show available quizzes',
+        '/leaderboard \\- View top 10 players',
+      ];
 
-/start - 🎮 Start the quiz game
-/help - 📖 Show this help message
-/listquizzes - 📝 Show available quizzes
-/leaderboard - 🏆 Show top 10 players
+      // Admin commands
+      const adminCommands = [
+        '',
+        '👑 *Admin Commands:*',
+        '/currentleaderboard \\- View detailed leaderboard with user IDs',
+      ];
 
-📌 Usage Tips:
-• Commands and responses are private
-• Your quiz progress is saved automatically
-• Each quiz can only be completed once`;
+      // Combine commands based on user role
+      const helpText = isAdmin
+        ? [...baseCommands, ...adminCommands]
+        : baseCommands;
 
-      await ctx.reply(helpMessage, {
+      await ctx.reply(helpText.join('\n'), {
+        parse_mode: 'MarkdownV2',
         protect_content: true,
       });
     } catch (error) {
@@ -127,13 +140,20 @@ const setupCommandHandlers = bot => {
 
       console.log('[DEBUG] Getting quiz list for user:', userId);
 
-      // Retrieve completed quizzes for the user
+      // Retrieve completed quizzes for the user with scores
       const completedQuizzes = await userQuizCollection
-        .find({ userId, completed: true })
+        .find({
+          userId: parseInt(userId),
+          completed: true,
+        })
         .toArray();
-      const completedQuizIds = completedQuizzes.map(quiz => quiz.quizId);
 
-      console.log('[DEBUG] Completed quizzes:', completedQuizIds);
+      const completedQuizMap = completedQuizzes.reduce((acc, quiz) => {
+        acc[quiz.quizId] = quiz;
+        return acc;
+      }, {});
+
+      console.log('[DEBUG] Completed quizzes:', completedQuizzes);
 
       // Initialize quiz list message
       let quizList = '📚 *Available Quizzes*\n\n';
@@ -143,24 +163,32 @@ const setupCommandHandlers = bot => {
         return text.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
       };
 
-      // Iterate over quizzes and format list with completion status
+      // Iterate over quizzes and format list with completion status and scores
       for (const [quizId, quiz] of Object.entries(quizzes)) {
-        const isCompleted = completedQuizIds.includes(parseInt(quizId));
-        const statusText = isCompleted ? 'Completed' : 'Available';
+        const completedQuiz = completedQuizMap[parseInt(quizId)];
+        const isCompleted = !!completedQuiz;
         const title = escapeSpecialChars(quiz.title);
 
         if (isCompleted) {
-          // For completed quizzes, show without link
-          quizList += `✅ Quiz ${quizId} ${title} \\(${statusText}\\)\n`;
+          // Show completed quiz with score
+          const score =
+            completedQuiz.correctAnswers || completedQuiz.finalScore || 0;
+          const totalQuestions =
+            completedQuiz.totalQuestions || quiz.questions.length;
+          const scorePercentage = Math.round((score / totalQuestions) * 100);
+
+          quizList += `✅ Quiz ${quizId}\\. ${title}\n`;
+          quizList += `   Score: ${score}/${totalQuestions} \\(${scorePercentage}%\\)\n\n`;
         } else {
-          // For incomplete quizzes, add a clickable callback button
-          quizList += `🔸 Quiz ${quizId} ${title} \\(${statusText}\\)\n`;
+          // Show available quiz
+          quizList += `🔸 Quiz ${quizId}\\. ${title}\n`;
+          quizList += `   Status: Available\n\n`;
         }
       }
 
       // Add inline keyboard buttons for incomplete quizzes
       const buttons = Object.entries(quizzes)
-        .filter(([quizId]) => !completedQuizIds.includes(parseInt(quizId)))
+        .filter(([quizId]) => !completedQuizMap[parseInt(quizId)])
         .map(([quizId, quiz]) => [
           Markup.button.callback(
             `Start Quiz ${quizId}`,
@@ -184,28 +212,39 @@ const setupCommandHandlers = bot => {
     }
   });
 
-  // For leaderboard command:
+  // Leaderboard command with quiz details
   bot.command('leaderboard', async ctx => {
     try {
       console.log('[DEBUG] Fetching leaderboard data...');
 
       const userQuizCollection = mongoose.connection.collection('userQuiz');
 
-      // More robust aggregation pipeline
+      // Enhanced aggregation pipeline
       const leaderboard = await userQuizCollection
         .aggregate([
           {
             $match: { completed: true },
           },
           {
+            $sort: { score: -1 }, // Sort by individual quiz scores
+          },
+          {
             $group: {
               _id: '$userId',
-              totalScore: { $sum: '$score' },
+              username: { $first: '$username' },
+              totalScore: { $sum: '$correctAnswers' },
+              quizzes: {
+                $push: {
+                  quizId: '$quizId',
+                  score: '$correctAnswers',
+                  totalQuestions: '$totalQuestions',
+                },
+              },
               quizCount: { $sum: 1 },
             },
           },
           {
-            $sort: { totalScore: -1, quizCount: -1 },
+            $sort: { totalScore: -1 },
           },
           {
             $limit: 10,
@@ -226,18 +265,34 @@ const setupCommandHandlers = bot => {
         return;
       }
 
-      // Format leaderboard message
+      // Format leaderboard message with quiz details
       let message = '🏆 *QUIZ LEADERBOARD* 🏆\n\n';
 
       for (let i = 0; i < leaderboard.length; i++) {
         const entry = leaderboard[i];
         const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '🎯';
         const position = `${i + 1}`.padStart(2, ' ');
+        const username = entry.username
+          ? escapeMarkdown(entry.username)
+          : 'Anonymous';
 
-        message += `${medal} ${position}\\. User ID: ${entry._id}\n`;
-        message += `    Score: ${entry.totalScore} points \\(${
-          entry.quizCount
-        } ${entry.quizCount === 1 ? 'quiz' : 'quizzes'}\\)\n\n`;
+        message += `${medal} ${position}\\. ${username}\n`;
+        message += `    Total Score: ${entry.totalScore} points\n`;
+        message += `    Completed Quizzes: ${entry.quizCount}\n`;
+
+        // Add details for each completed quiz
+        entry.quizzes.forEach((quiz, index) => {
+          const quizTitle =
+            quizzes[quiz.quizId]?.title || `Quiz ${quiz.quizId}`;
+          const scorePercent = Math.round(
+            (quiz.score / quiz.totalQuestions) * 100
+          );
+          message += `    ${index + 1}\\. ${escapeMarkdown(quizTitle)}: ${
+            quiz.score
+          }/${quiz.totalQuestions} \\(${scorePercent}%\\)\n`;
+        });
+
+        message += '\n';
       }
 
       await ctx.reply(message, {
@@ -282,6 +337,61 @@ const setupCommandHandlers = bot => {
         });
       }
     });
+  });
+
+  // Current Leaderboard Command (Admin Only)
+  bot.command('currentleaderboard', async ctx => {
+    try {
+      await ctx.deleteMessage().catch(console.error);
+
+      if (
+        process.env.NODE_ENV === 'local' ||
+        config.bot.adminIds.includes(ctx.from.id)
+      ) {
+        const userQuizCollection = mongoose.connection.collection('userQuiz');
+        const leaderboard = await userQuizCollection
+          .find({ completed: true })
+          .toArray();
+
+        let leaderboardText = `📊 *Detailed Leaderboard:*\n\n`;
+
+        if (leaderboard.length === 0) {
+          leaderboardText += 'No completed quizzes yet\\.';
+        } else {
+          // Sort users by score in descending order
+          const sortedLeaderboard = leaderboard.sort(
+            (a, b) => (b.score || 0) - (a.score || 0)
+          );
+
+          sortedLeaderboard.forEach((user, index) => {
+            // Escape special characters for MarkdownV2
+            const username = user.username
+              ? user.username.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&')
+              : 'Unknown';
+            leaderboardText += `${index + 1}\\. TG ID: \`${
+              user.userId
+            }\` \\- ${username} \\- ${user.score || 0} points\n`;
+          });
+        }
+
+        await ctx.reply(leaderboardText, {
+          parse_mode: 'MarkdownV2',
+          protect_content: true,
+        });
+      } else {
+        await ctx.reply("You don't have permission to use this command.", {
+          protect_content: true,
+        });
+      }
+    } catch (error) {
+      console.error('Error in currentleaderboard command:', error);
+      await ctx.reply(
+        'An error occurred while fetching the detailed leaderboard.',
+        {
+          protect_content: true,
+        }
+      );
+    }
   });
 
   // Set up available commands in Telegram menu

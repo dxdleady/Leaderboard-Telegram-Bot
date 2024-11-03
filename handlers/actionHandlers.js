@@ -251,6 +251,29 @@ const setupActionHandlers = bot => {
         return;
       }
 
+      const quiz = quizzes[quizId];
+      const questionData = quiz.questions[questionIndex];
+      const userAnswer = questionData.options[answerIndex];
+      const isCorrect = userAnswer === questionData.correct;
+
+      // Calculate score immediately after checking the answer
+      const userQuizCollection = mongoose.connection.collection('userQuiz');
+      await userQuizCollection.updateOne(
+        {
+          userId: userId,
+          quizId: quizId,
+        },
+        {
+          $set: {
+            username: ctx.from.username || 'Unknown',
+          },
+          $inc: {
+            correctAnswers: isCorrect ? 1 : 0,
+          },
+        },
+        { upsert: true }
+      );
+
       // Mark question as answered immediately
       quizState.answeredQuestions.add(questionIndex);
       quizState.currentQuestion = questionIndex + 1;
@@ -263,11 +286,6 @@ const setupActionHandlers = bot => {
           ctx.callbackQuery.message.message_id
         );
       }
-
-      const quiz = quizzes[quizId];
-      const questionData = quiz.questions[questionIndex];
-      const userAnswer = questionData.options[answerIndex];
-      const isCorrect = userAnswer === questionData.correct;
 
       // Update session state
       userSession.currentQuestionIndex = questionIndex + 1;
@@ -290,17 +308,22 @@ const setupActionHandlers = bot => {
         await sendQuizQuestion(bot, chatId, quizId, questionIndex + 1, userId);
       } else {
         // Quiz completion handling
-        const userQuizCollection = mongoose.connection.collection('userQuiz');
-        const userQuiz = await userQuizCollection.findOne({ userId, quizId });
+        const userQuiz = await userQuizCollection.findOne({
+          userId: parseInt(userId),
+          quizId: parseInt(quizId),
+        });
+
         const totalQuestions = quiz.questions.length;
-        const userScore = userQuiz?.score || 0;
-        const scorePercentage = Math.round((userScore / totalQuestions) * 100);
+        const correctAnswers = userQuiz?.correctAnswers || 0;
+        const scorePercentage = Math.round(
+          (correctAnswers / totalQuestions) * 100
+        );
 
         const completionText = [
           '🎉 *Quiz Completed\\!*',
           '',
           '📊 *Your Results:*',
-          `✓ Score: ${userScore}/${totalQuestions} \\(${scorePercentage}%\\)`,
+          `✓ Score: ${correctAnswers}/${totalQuestions} \\(${scorePercentage}%\\)`,
           scorePercentage === 100
             ? "🏆 Perfect Score\\! You're eligible for the prize draw\\!"
             : 'Keep trying to get a perfect score\\!',
@@ -317,9 +340,20 @@ const setupActionHandlers = bot => {
           protect_content: true,
         });
 
+        // Final update with completion status
         await userQuizCollection.updateOne(
-          { userId, quizId },
-          { $set: { completed: true } },
+          {
+            userId: userId,
+            quizId: quizId,
+          },
+          {
+            $set: {
+              completed: true,
+              username: ctx.from.username || 'Unknown',
+              finalScore: correctAnswers,
+              totalQuestions: totalQuestions,
+            },
+          },
           { upsert: true }
         );
 
@@ -343,7 +377,6 @@ const setupActionHandlers = bot => {
       await ctx.answerCbQuery();
     }
   });
-
   return bot;
 };
 
