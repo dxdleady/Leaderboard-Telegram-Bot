@@ -22,78 +22,7 @@ const handler = async (req, res) => {
   );
 
   try {
-    // Add security check for Telegram requests
-    if (req.method === 'POST') {
-      // Verify the request is from Telegram
-      const telegramToken = process.env.BOT_TOKEN;
-      if (!telegramToken) {
-        console.error('[DEBUG] BOT_TOKEN not set');
-        return res.status(401).json({ error: 'Unauthorized' });
-      }
-
-      try {
-        // Get raw body as Buffer
-        const buf = await rawBody(req);
-        const text = buf.toString();
-
-        // Log the incoming data for debugging
-        console.log(
-          '[DEBUG] Received webhook data:',
-          text.substring(0, 100) + '...'
-        );
-
-        // Parse update
-        const update = JSON.parse(text);
-
-        // Ensure database connection
-        await ensureDatabaseConnection();
-
-        // Initialize or get bot instance
-        const currentBot = await initBot();
-        if (!currentBot) {
-          throw new Error('Failed to initialize bot');
-        }
-
-        console.log(
-          '[DEBUG] Update type:',
-          update.message
-            ? 'message'
-            : update.callback_query
-            ? 'callback_query'
-            : 'other'
-        );
-
-        // Process update with timeout
-        const updatePromise = currentBot.handleUpdate(update);
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(
-            () => reject(new Error('Update processing timeout')),
-            25000
-          )
-        );
-
-        await Promise.race([updatePromise, timeoutPromise]);
-
-        const processingTime = Date.now() - startTime;
-        console.log(
-          '[DEBUG] Update processed successfully, took:',
-          processingTime,
-          'ms'
-        );
-
-        return res.status(200).json({ ok: true });
-      } catch (error) {
-        console.error('[DEBUG] Webhook processing error:', error);
-        // Still return 200 to Telegram but include error details
-        return res.status(200).json({
-          ok: true,
-          error: error.message,
-          processingTime: Date.now() - startTime,
-        });
-      }
-    }
-
-    // Health check endpoint
+    // Health check endpoint - always available
     if (req.method === 'GET') {
       const status = {
         ok: true,
@@ -113,9 +42,66 @@ const handler = async (req, res) => {
       return res.status(200).json(status);
     }
 
+    // Handle webhook updates
+    if (req.method === 'POST') {
+      console.log('[DEBUG] Processing webhook update...');
+
+      // Always parse the body first
+      const buf = await rawBody(req);
+      const text = buf.toString();
+
+      // Log incoming data for debugging
+      console.log('[DEBUG] Received webhook data length:', text.length);
+      console.log('[DEBUG] First 200 characters:', text.substring(0, 200));
+
+      try {
+        // Parse the update
+        const update = JSON.parse(text);
+
+        // Ensure database connection
+        console.log('[DEBUG] Ensuring database connection...');
+        await ensureDatabaseConnection();
+
+        // Initialize or get bot instance
+        console.log('[DEBUG] Getting bot instance...');
+        const currentBot = await initBot();
+        if (!currentBot) {
+          throw new Error('Failed to initialize bot');
+        }
+
+        console.log(
+          '[DEBUG] Update type:',
+          update.message
+            ? 'message'
+            : update.callback_query
+            ? 'callback_query'
+            : 'other'
+        );
+
+        // Process update with timeout
+        console.log('[DEBUG] Processing update...');
+        await currentBot.handleUpdate(update);
+
+        const processingTime = Date.now() - startTime;
+        console.log(
+          '[DEBUG] Update processed successfully, took:',
+          processingTime,
+          'ms'
+        );
+
+        // Always return 200 OK to Telegram
+        return res.status(200).json({ ok: true });
+      } catch (error) {
+        console.error('[DEBUG] Error processing webhook update:', error);
+        // Still return 200 to Telegram even on error
+        return res.status(200).json({ ok: true });
+      }
+    }
+
+    // Method not allowed
     return res.status(405).json({ error: 'Method not allowed' });
   } catch (error) {
-    console.error('[DEBUG] Handler error:', error);
+    console.error('[DEBUG] Critical handler error:', error);
     // Always return 200 to Telegram
     return res.status(200).json({ ok: true });
   }
